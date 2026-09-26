@@ -1,0 +1,510 @@
+CHAPTER 1: Windows Internals Overview (PDF pages 9-27)
+
+===== [PDF page 9] =====
+Chapter 1: Windows Internals Overview
+This chapter describes the most important concepts in the internal workings of Windows. Some of the
+topics will be described in greater detail later in the book, where it’s closely related to the topic at hand.
+Make sure you understand the concepts in this chapter, as these make the foundations upon any driver
+and even user mode low-level code, is built.
+In this chapter:
+• Processes
+• Virtual Memory
+• Threads
+• System Services
+• System Architecture
+• Handles and Objects
+Processes
+A process is a containment and management object that represents a running instance of a program. The
+term “process runs” which is used fairly often, is inaccurate. Processes don’t run – processes manage.
+Threads are the ones that execute code and technically run. From a high-level perspective, a process owns
+the following:
+• An executable program, which contains the initial code and data used to execute code within the
+process. This is true for most processes, but some special ones don’t have an executable image
+(created directly by the kernel).
+• A private virtual address space, used for allocating memory for whatever purposes the code within
+the process needs it.
+• An access token (called primary token), which is an object that stores the security context of the
+process, used by threads executing in the process (unless a thread assumes a different token by using
+impersonation).
+• A private handle table to executive objects, such as events, semaphores, and files.
+• One or more threads of execution. A normal user-mode process is created with one thread (executing
+the classic main/WinMain function). A user mode process without threads is mostly useless, and
+under normal circumstances will be destroyed by the kernel.
+
+===== [PDF page 10] =====
+Chapter 1: Windows Internals Overview
+4
+These elements of a process are depicted in figure 1-1.
+Figure 1-1: Important ingredients of a process
+A process is uniquely identified by its Process ID, which remains unique as long as the kernel process object
+exists. Once it’s destroyed, the same ID may be reused for new processes. It’s important to realize that the
+executable file itself is not a unique identifier of a process. For example, there may be five instances of
+notepad.exe running at the same time. Each of these Notepad instances has its own address space, threads,
+handle table, process ID, etc. All those five processes are using the same image file (notepad.exe) as their
+initial code and data. Figure 1-2 shows a screenshot of Task Manager’s Details tab showing five instances
+of Notepad.exe, each with its own attributes.
+
+===== [PDF page 11] =====
+Chapter 1: Windows Internals Overview
+5
+Figure 1-2: Five instances of notepad
+Virtual Memory
+Every process has its own virtual, private, linear address space. This address space starts out empty (or
+close to empty, since the executable image and NtDll.Dll are the first to be mapped, followed by more
+subsystem DLLs). Once execution of the main (first) thread begins, memory is likely to be allocated, more
+DLLs loaded, etc. This address space is private, which means other processes cannot access it directly.
+The address space range starts at zero (technically the first and last 64KB of the address space cannot be
+committed), and goes all the way to a maximum which depends on the process “bitness” (32 or 64 bit) and
+the operating system “bitness” as follows:
+• For 32-bit processes on 32-bit Windows systems, the process address space size is 2 GB by default.
+• For 32-bit processes on 32-bit Windows systems that use the increase user virtual address space
+setting, can be configured to have up to 3GB of address space per process. To get the extended
+address space, the executable from which the process was created must have been marked with the
+LARGEADDRESSAWARE linker flag in its PE header. If it was not, it would still be limited to 2 GB.
+• For 64-bit processes (on a 64-bit Windows system, naturally), the address space size is 8 TB (Windows
+8 and earlier) or 128 TB (Windows 8.1 and later).
+• For 32-bit processes on a 64-bit Windows system, the address space size is 4 GB if the executable
+image has the LARGEADDRESSAWARE flag in its PE header. Otherwise, the size remains at 2 GB.
+The requirement of the LARGEADDRESSAWARE flag stems from the fact that a 2 GB address
+range requires 31 bits only, leaving the most significant bit (MSB) free for application use.
+Specifying this flag indicates that the program is not using bit 31 for anything and so having
+that bit set (which would happen for addresses larger than 2 GB) is not an issue.
+
+===== [PDF page 12] =====
+Chapter 1: Windows Internals Overview
+6
+Each process has its own address space, which makes any process address relative, rather than absolute.
+For example, when trying to determine what lies in address 0x20000, the address itself is not enough; the
+process to which this address relates to must be specified.
+The memory itself is called virtual, which means there is an indirect relationship between an address
+and the exact location where it’s found in physical memory (RAM). A buffer within a process may be
+mapped to physical memory, or it may temporarily reside in a file (such as a page file). The term virtual
+refers to the fact that from an execution perspective, there is no need to know if the memory about to be
+accessed is in RAM or not; if the memory is indeed mapped to RAM, the CPU will perform the virtual-
+to-physical translation before accessing the data. if the memory is not resident (specified by a flag in the
+translation table entry), the CPU will raise a page fault exception that causes the memory manager’s page
+fault handler to fetch the data from the appropriate file (if indeed it’s a valid page fault), copy it to RAM,
+make the required changes in the page table entries that map the buffer, and instruct the CPU to try again.
+Figure 1-3 shows this conceptual mapping from virtual to physical memory for two processes.
+Figure 1-3: virtual memory mapping
+The unit of memory management is called a page. Every attribute related to memory is always at a
+page’s granularity, such as its protection or state. The size of a page is determined by CPU type (and on
+some processors, may be configurable), and in any case, the memory manager must follow suit. Normal
+(sometimes called small) page size is 4 KB on all Windows-supported architectures.
+Apart from the normal (small) page size, Windows also supports large pages. The size of a large page is 2
+MB (x86/x64/ARM64) or 4 MB (ARM). This is based on using the Page Directory Entry (PDE) to map the
+large page without using a page table. This results in quicker translation, but most importantly better use
+of the Translation Lookaside Buffer (TLB) – a cache of recently translated pages maintained by the CPU.
+
+===== [PDF page 13] =====
+Chapter 1: Windows Internals Overview
+7
+In the case of a large page, a single TLB entry maps significantly more memory than a small page.
+The downside of large pages is the need to have the memory contiguous in RAM, which can
+fail if memory is tight or very fragmented. Also, large pages are always non-pageable and can
+only use read/write protection.
+Huge pages
+of 1 GB in size are supported on Windows 10 and Server 2016 and later. These are used automatically with
+large pages if an allocation is at least 1 GB in size, and that size can be located as contiguous in RAM.
+Page States
+Each page in virtual memory can be in one of three states:
+• Free – the page is not allocated in any way; there is nothing there. Any attempt to access that page
+would cause an access violation exception. Most pages in a newly created process are free.
+• Committed – the reverse of free; an allocated page that can be accessed successfully (assuming non-
+conflicting protection attributes; for example, writing to a read-only page causes an access violation).
+Committed pages are mapped to RAM or to a file (such as a page file).
+• Reserved – the page is not committed, but the address range is reserved for possible future
+commitment. From the CPU’s perspective, it’s the same as Free – any access attempt raises an
+access violation exception. However, new allocation attempts using the VirtualAlloc function
+(or NtAllocateVirtualMemory, the related native API) that does not specify a specific address
+would not allocate in the reserved region. A classic example of using reserved memory to maintain
+contiguous virtual address space while conserving committed memory usage is described later in
+this chapter in the section “Thread Stacks”.
+System Memory
+The lower part of the address space is for user-mode processes use. While a particular thread is executing,
+its associated process address space is visible from address zero to the upper limit as described in the
+previous section. The operating system, however, must also reside somewhere – and that somewhere is
+the upper address range that’s supported on the system, as follows:
+• On 32-bit systems running without the increase user virtual address space setting, the operating sys-
+tem resides in the upper 2 GB of virtual address space, from address 0x80000000 to 0xFFFFFFFF.
+• On 32-bit systems configured with the increase user virtual address space setting, the operating
+system resides in the address space left. For example, if the system is configured with 3 GB user
+address space per process (the maximum), the OS takes the upper 1 GB (from address 0xC0000000
+to 0xFFFFFFFF). The component that suffers mostly from this address space reduction is the file
+system cache.
+• On 64-bit systems running Windows 8, Server 2012 and earlier, the OS takes the upper 8 TB of virtual
+address space.
+• On 64-bit systems running Windows 8.1, Server 2012 R2 and later, the OS takes the upper 128 TB of
+virtual address space.
+
+===== [PDF page 14] =====
+Chapter 1: Windows Internals Overview
+8
+Figure 1-4 shows the virtual memory layout for the two “extreme” cases: 32-bit process on a 32-bit system
+(left) and a 64-bit process on a 64-bit system (right).
+Figure 1-4: virtual memory layout
+System space is not process-relative – after all, it’s the same system, the same kernel, the same drivers that
+service every process on the system (the exception is some system memory that is on a per-session basis
+but is not important for this discussion). It follows that any address in system space is absolute rather than
+relative, since it “looks” the same from every process context. Of course, actual access from user mode into
+system space results in an access violation exception.
+System space is where the kernel itself, the Hardware Abstraction Layer (HAL), and kernel drivers reside
+once loaded. Thus, kernel drivers are automatically protected from direct user mode access. It also means
+they have a potentially system-wide impact. For example, if a kernel driver leaks memory, that memory
+will not be freed even after the driver unloads. User-mode processes, on the other hand, can never leak
+anything beyond their lifetime. The kernel is responsible for closing and freeing everything private to a
+dead process (all handles are closed and all private memory is freed).
+Threads
+The actual entities that execute code are threads. A Thread is contained within a process, using the
+resources exposed by the process to do work (such as virtual memory and handles to kernel objects).
+The most important information a thread owns is the following:
+• Current access mode, either user or kernel.
+• Execution context, including processor registers and execution state.
+• One or two stacks, used for local variable allocations and call management.
+• Thread Local Storage (TLS) array, which provides a way to store thread-private data with uniform
+access semantics.
+• Base priority and a current (dynamic) priority.
+• Processor affinity, indicating on which processors the thread is allowed to run on.
+
+===== [PDF page 15] =====
+Chapter 1: Windows Internals Overview
+9
+The most common states a thread can be in are:
+• Running – currently executing code on a (logical) processor.
+• Ready – waiting to be scheduled for execution because all relevant processors are busy or
+unavailable.
+• Waiting – waiting for some event to occur before proceeding. Once the event occurs, the thread
+goes to the Ready state.
+Figure 1-5 shows the state diagram for these states. The numbers in parenthesis indicate the state numbers,
+as can be viewed by tools such as Performance Monitor. Note that the Ready state has a sibling state called
+Deferred Ready, which is similar, and exists to minimize internal locking.
+Figure 1-5: Common thread states
+Thread Stacks
+Each thread has a stack it uses while executing, used to store local variables, parameters passed to functions
+(in some cases), and where return addresses are stored prior to making function calls. A thread has at least
+one stack residing in system (kernel) space, and it’s pretty small (default is 12 KB on 32-bit systems and 24
+KB on 64-bit systems). A user-mode thread has a second stack in its process user-space address range and
+is considerably larger (by default can grow to 1 MB). An example with three user-mode threads and their
+stacks is shown in figure 1-6. In the figure, threads 1 and 2 are in process A and thread 3 is in process B.
+The kernel stack always resides in RAM while the thread is in the Running or Ready states. The reason
+for this is subtle and will be discussed later in this chapter. The user-mode stack, on the other hand, may
+be paged out, just like any other user-mode memory.
+The user-mode stack is handled differently than the kernel-mode stack in terms of its size. It starts out
+with a certain amount of committed memory (could be as small as a single page), where the next page is
+committed with a PAGE_GUARD attribute. The rest of the stack address space memory is reserved, thus
+not wasting memory. The idea is to grow the stack in case the thread’s code needs to use more stack space.
+
+===== [PDF page 16] =====
+Chapter 1: Windows Internals Overview
+10
+If the thread needs more stack space it would access the guard page which would throw a page-guard
+exception. The memory manager then removes the guard protection, and commits an additional page,
+marking it with a PAGE_GUARD attribute. This way, the stack grows as needed, avoiding the entire stack
+memory being committed upfront. Figure 1-7 shows this layout.
+Figure 1-6: User mode threads and their stacks
+Technically, Windows uses 3 guard pages rather than one in most cases.
+
+===== [PDF page 17] =====
+Chapter 1: Windows Internals Overview
+11
+Figure 1-7: Thread’s stack in user space
+The sizes of a thread’s user-mode stack are determined as follows:
+• The executable image has a stack commit and reserved values in its Portable Executable (PE) header.
+These are taken as defaults if a thread does not specify alternative values. These are always used for
+the first thread in the process.
+• When a thread is created with CreateThread (or similar functions), the caller can specify its
+required stack size, either the upfront committed size or the reserved size (but not both), depending
+on a flag provided to the function; specifying zero uses the defaults set in the PE header.
+Curiously enough, the functions CreateThread and CreateRemoteThread(Ex) only
+allow specifying a single value for the stack size and can be the committed or the reserved size,
+but not both. The native (undocumented) function, NtCreateThreadEx allows specifying
+both values.
+System Services (a.k.a. System Calls)
+Applications need to perform various operations that are not purely computational, such as allocating
+memory, opening files, creating threads, etc. These operations can only be ultimately performed by code
+running in kernel mode. So how would user-mode code be able to perform such operations?
+Let’s take a common (simple) example: a user running a Notepad process uses the File / Open menu to
+request opening a file. Notepad’s code responds by calling the CreateFile documented Windows API
+function. CreateFile is documented as implemented in kernel32.Dll, one of the Windows subsystem
+DLLs. This function still runs in user mode, so there is no way it can directly open a file. After some
+error checking, it calls NtCreateFile, a function implemented in NTDLL.dll, a foundational DLL that
+implements the API known as the Native API, and is the lowest layer of code which is still in user mode.
+This function (documented in the Windows Driver Kit for device driver developers) is the one that makes
+the transition to kernel mode. Before the actual transition, it puts a number, called system service number,
+into a CPU register (EAX on Intel/AMD architectures). Then it issues a special CPU instruction (syscall
+
+===== [PDF page 18] =====
+Chapter 1: Windows Internals Overview
+12
+on x64 or sysenter on x86) that makes the actual transition to kernel mode while jumping to a predefined
+routine called the system service dispatcher.
+The system service dispatcher, in turn, uses the value in that EAX register as an index into a System Service
+Dispatch Table (SSDT). Using this table, the code jumps to the system service (system call) itself. For
+our Notepad example, the SSDT entry would point to the NtCreateFile function, implemented by the
+kernel’s I/O manager. Notice the function has the same name as the one in NTDLL.dll, and has the same
+parameters as well. On the kernel side is the real implementation. Once the system service is complete,
+the thread returns to user mode to execute the instruction following sysenter/syscall. This sequence
+of calls is depicted in figure 1-8.
+Figure 1-8: System service function call flow
+
+===== [PDF page 19] =====
+Chapter 1: Windows Internals Overview
+13
+General System Architecture
+Figure 1-9 shows the general architecture of Windows, comprising of user-mode and kernel-mode
+components.
+Figure 1-9: Windows system architecture
+Here’s a quick rundown of the named boxes appearing in figure 1-9:
+• User processes
+These are normal processes based on image files, executing on the system, such as instances of
+Notepad.exe, cmd.exe, explorer.exe, and so on.
+• Subsystem DLLs
+Subsystem DLLs are dynamic link libraries (DLLs) that implement the API of a subsystem. A
+subsystem is a particular view of the capabilities exposed by the kernel. Technically, starting from
+Windows 8.1, there is only a single subsystem – the Windows Subsystem. The subsystem DLLs
+include well-known files, such as kernel32.dll, user32.dll, gdi32.dll, advapi32.dll, combase.dll, and
+many others. These include mostly the officially documented API of Windows.
+• NTDLL.DLL
+A system-wide DLL, implementing the Windows native API. This is the lowest layer of code which
+is still in user mode. Its most important role is to make the transition to kernel mode for system call
+invocation. NTDLL also implements the Heap Manager, the Image Loader and some part of the user
+mode thread pool.
+
+===== [PDF page 20] =====
+Chapter 1: Windows Internals Overview
+14
+• Service Processes
+Service processes are normal Windows processes that communicate with the Service Control
+Manager (SCM, implemented in services.exe) and allow some control over their lifetime. The SCM
+can start, stop, pause, resume and send other messages to services. Services typically execute under
+one of the special Windows accounts – local system, network service or local service.
+• Executive
+The Executive is the upper layer of NtOskrnl.exe (the “kernel”). It hosts most of the code that is
+in kernel mode. It includes mostly the various “managers”: Object Manager, Memory Manager, I/O
+Manager, Plug & Play Manager, Power Manager, Configuration Manager, etc. It’s by far larger than
+the lower Kernel layer.
+• Kernel
+The Kernel layer implements the most fundamental and time-sensitive parts of kernel-mode OS
+code. This includes thread scheduling, interrupt and exception dispatching, and implementation of
+various kernel primitives such as mutexes and semaphores. Some of the kernel code is written in
+CPU-specific machine language for efficiency and for getting direct access to CPU-specific details.
+• Device Drivers
+Device drivers are loadable kernel modules. Their code executes in kernel mode and so has the full
+power of the kernel. This book is dedicated to writing certain types of kernel drivers.
+• Win32k.sys
+This is the kernel-mode component of the Windows subsystem. Essentially, it’s a kernel module
+(driver) that handles the user interface part of Windows and the classic Graphics Device Inter-
+face (GDI) APIs. This means that all windowing operations (CreateWindowEx, GetMessage,
+PostMessage, etc.) are handled by this component. The rest of the system has little-to-none
+knowledge of UI.
+• Hardware Abstraction Layer (HAL)
+The HAL is a software abstraction layer over the hardware closest to the CPU. It allows device
+drivers to use APIs that do not require detailed and specific knowledge of things like Interrupt
+Controllers or DMA controller. Naturally, this layer is mostly useful for device drivers written to
+handle hardware devices.
+• System Processes
+System processes is an umbrella term used to describe processes that are typically “just there”, doing
+their thing where normally these processes are not communicated with directly. They are important
+nonetheless, and some in fact, critical to the system’s well-being. Terminating some of them is fatal
+and causes a system crash. Some of the system processes are native processes, meaning they use
+the native API only (the API implemented by NTDLL). Example system processes include Smss.exe,
+Lsass.exe, Winlogon.exe, and Services.exe.
+• Subsystem Process
+The Windows subsystem process, running the image Csrss.exe, can be viewed as a helper to the
+kernel for managing processes running under the Windows subsystem. It is a critical process,
+meaning if killed, the system would crash. There is one Csrss.exe instance per session, so on a
+standard system two instances would exist – one for session 0 and one for the logged-on user session
+(typically 1). Although Csrss.exe is the “manager” of the Windows subsystem (the only one left these
+days), its importance goes beyond just this role.
+
+===== [PDF page 21] =====
+Chapter 1: Windows Internals Overview
+15
+• Hyper-V Hypervisor
+The Hyper-V hypervisor exists on Windows 10 and server 2016 (and later) systems if they support
+Virtualization Based Security (VBS). VBS provides an extra layer of security, where the normal OS is
+a virtual machine controlled by Hyper-V. Two distinct Virtual Trust Levels (VTLs) are defined, where
+VTL 0 consists of the normal user-mode/kernel-mode we know of, and VTL 1 contains the secure
+kernel and Isolated User Mode (IUM). VBS is beyond the scope of this book. For more information,
+check out the Windows Internals book and/or the Microsoft documentation.
+Windows 10 version 1607 introduced the Windows Subsystem for Linux (WSL). Although this
+may look like yet another subsystem, like the old POSIX and OS/2 subsystems supported by
+Windows, it is not like that at all. The old subsystems were able to execute POSIX and OS/2 apps
+if these were compiled using a Windows compiler to use the PE format and Windows system
+calls. WSL, on the other hand, has no such requirement. Existing executables from Linux (stored
+in ELF format) can be run as-is on Windows, without any recompilation.
+To make something like this work, a new process type was created – the Pico process together
+with a Pico provider. Briefly, a Pico process is an empty address space (minimal process) that is
+used for WSL processes, where every system call (Linux system call) must be intercepted and
+translated to the Windows system call(s) equivalent using that Pico provider (a device driver).
+There is a true Linux (the user-mode part) installed on the Windows machine.
+The above description is for WSL version 1. Starting with Windows 10 version 2004, Windows
+supports a new version of WSL known as WSL 2. WSL 2 is not based on pico processes anymore.
+Instead, it’s based on a hybrid virtual machine technology that allows installing a full Linux
+system (including the Linux kernel), but still see and share the Windows machine’s resources,
+such as the file system. WSL 2 is faster than WSL 1 and solves some edge cases that didn’t work
+well in WSL 1, thanks to the real Linux kernel handling Linux system calls.
+Handles and Objects
+The Windows kernel exposes various types of objects for use by user-mode processes, the kernel itself and
+kernel-mode drivers. Instances of these types are data structures in system space, created by the Object
+Manager (part of the executive) when requested to do so by user-mode or kernel-mode code. Objects are
+reference counted – only when the last reference to the object is released will the object be destroyed and
+freed from memory.
+Since these object instances reside in system space, they cannot be accessed directly by user mode. User
+mode must use an indirect access mechanism, known as handles. A handle is an index to an entry in a table
+maintained on a process by process basis, stored in kernel space, that points to a kernel object residing in
+system space. There are various Create* and Open* functions to create/open objects and retrieve back
+handles to these objects. For example, the CreateMutex user-mode function allows creating or opening a
+mutex (depending on whether the object is named and exists). If successful, the function returns a handle
+to the object. A return value of zero means an invalid handle (and a function call failure). The OpenMutex
+function, on the other hand, tries to open a handle to a named mutex. If the mutex with that name does
+not exist, the function fails and returns null (0).
+
+===== [PDF page 22] =====
+Chapter 1: Windows Internals Overview
+16
+Kernel (and driver) code can use either a handle or a direct pointer to an object. The choice is usually
+based on the API the code wants to call. In some cases, a handle given by user mode to the driver must be
+turned into a pointer with the ObReferenceObjectByHandle function. We’ll discuss these details in a
+later chapter.
+Most functions return null (zero) on failure, but some do not. Most notably, the CreateFile
+function returns INVALID_HANDLE_VALUE (-1) if it fails.
+Handle values are multiples of 4, where the first valid handle is 4; Zero is never a valid handle value.
+Kernel-mode code can use handles when creating/opening objects, but they can also use direct pointers
+to kernel objects. This is typically done when a certain API demands it. Kernel code can get a pointer
+to an object given a valid handle using the ObReferenceObjectByHandle function. If successful,
+the reference count on the object is incremented, so there is no danger that if the user-mode client
+holding the handle decided to close it while kernel code holds a pointer to the object would now hold
+a dangling pointer. The object is safe to access regardless of the handle-holder until the kernel code calls
+ObDerefenceObject, which decrements the reference count; if the kernel code missed this call, that’s
+a resource leak which will only be resolved in the next system boot.
+All objects are reference counted. The object manager maintains a handle count and total reference count
+for objects. Once an object is no longer needed, its client should close the handle (if a handle was used to
+access the object) or dereference the object (if kernel client using a pointer). From that point on, the code
+should consider its handle/pointer to be invalid. The Object Manager will destroy the object if its reference
+count reaches zero.
+Each object points to an object type, which holds information on the type itself, meaning there is a single
+type object for each type of object. These are also exposed as exported global kernel variables, some of
+which are defined in the kernel headers and are needed in certain cases, as we’ll see in later chapters.
+Object Names
+Some types of objects can have names. These names can be used to open objects by name with a suitable
+Open function. Note that not all objects have names; for example, processes and threads don’t have names
+– they have IDs. That’s why the OpenProcess and OpenThread functions require a process/thread
+identifier (a number) rather than a string-base name. Another somewhat weird case of an object that does
+not have a name is a file. The file name is not the object’s name – these are different concepts.
+Threads appear to have a name (starting from Windows 10), that can be set with the user-
+mode API SetThreadDescription. This is not, however, a true name, but rather a friendly
+name/description most useful in debugging, as Visual Studio shows a thread’s description, if
+there is any.
+
+===== [PDF page 23] =====
+Chapter 1: Windows Internals Overview
+17
+From user-mode code, calling a Create function with a name creates the object with that name if an object
+with that name does not exist, but if it exists it just opens the existing object. In the latter case, calling
+GetLastError returns ERROR_ALREADY_EXISTS, indicating this is not a new object, and the returned
+handle is yet another handle to an existing object.
+The name provided to a Create function is not actually the final name of the object. It’s prepended with
+\Sessions\x\BaseNamedObjects\ where x is the session ID of the caller. If the session is zero, the name is
+prepended with \BaseNamedObjects\. If the caller happens to be running in an AppContainer (typically
+a Universal Windows Platform process), then the prepended string is more complex and consists of the
+unique AppContainer SID: \Sessions\x\AppContainerNamedObjects\{AppContainerSID}.
+All the above means is that object names are session-relative (and in the case of AppContainer – package
+relative). If an object must be shared across sessions it can be created in session 0 by prepending
+the object name with Global\; for example, creating a mutex with the CreateMutex function named
+Global\MyMutex will create it under \BaseNamedObjects. Note that AppContainers do not have the power
+to use session 0 object namespace.
+This hierarchy can be viewed with the Sysinternals WinObj tool (run elevated) as shown in figure 1-10.
+Figure 1-10: Sysinternals WinObj tool
+The view shown in figure 1-9 is the object manager namespace, comprising of a hierarchy of named objects.
+This entire structure is held in memory and manipulated by the Object Manager (part of the Executive)
+
+===== [PDF page 24] =====
+Chapter 1: Windows Internals Overview
+18
+as required. Note that unnamed objects are not part of this structure, meaning the objects seen in WinObj
+do not comprise all the existing objects, but rather all the objects that were created with a name.
+Every process has a private handle table to kernel objects (whether named or not), which can be viewed
+with the Process Explorer and/or Handles Sysinternals tools. A screenshot of Process Explorer showing
+handles in some process is shown in figure 1-11. The default columns shown in the handles view are the
+object type and name only. However, there are other columns available, as shown in figure 1-11.
+Figure 1-11: Viewing handles in processes with Process Explorer
+By default, Process Explorer shows only handles for objects, which have names (according to Process
+Explorer’s definition of a name, discussed shortly). To view all handles in a process, select Show Unnamed
+Handles and Mappings from Process Explorer’s View menu.
+The various columns in the handle view provide more information for each handle. The handle value and
+the object type are self explanatory. The name column is tricky. It shows true object names for Mutexes
+(Mutants), Semaphores, Events, Sections, ALPC Ports, Jobs, Timers, Directory (object manager Directories,
+not file system directories), and other, less used object types. Yet others are shown with a name that has a
+different meaning than a true named object:
+• Process and Thread objects, the name is shown as their unique ID.
+• For File objects, it shows the file name (or device name) pointed to by the file object. It’s not the
+same as an object’s name, as there is no way to get a handle to a file object given the file name -
+only a new file object may be created that accesses the same underlying file or device (assuming
+sharing settings for the original file object allow it).
+• (Registry) Key objects names are shown with the path to the registry key. This is not a name, for
+the same reasoning as for file objects.
+• Token object names are shown with the user name stored in the token.
+
+===== [PDF page 25] =====
+Chapter 1: Windows Internals Overview
+19
+Accessing Existing Objects
+The Access column in Process Explorer’s handles view shows the access mask which was used to open or
+create the handle. This access mask is key to what operations are allowed to be performed with a specific
+handle. For example, if client code wants to terminate a process, it must call the OpenProcess function
+first, to obtain a handle to the required process with an access mask of (at least) PROCESS_TERMINATE,
+otherwise there is no way to terminate the process with that handle. If the call succeeds, then the call to
+TerminateProcess is bound to succeed.
+Here’s a user-mode example for terminating a process given a process ID:
+bool KillProcess(DWORD pid) {
+//
+// open a powerful-enough handle to the process
+//
+HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+if (!hProcess)
+return false;
+//
+// now kill it with some arbitrary exit code
+//
+BOOL success = TerminateProcess(hProcess, 1);
+//
+// close the handle
+//
+CloseHandle(hProcess);
+return success != FALSE;
+}
+The Decoded Access column provides a textual description of the access mask (for some object types),
+making it easier to identify the exact access allowed for a particular handle.
+Double-clicking a handle entry (or right-clicking and selecting Properties) shows some of the object’s
+properties. Figure 1-12 shows a screenshot of an example event object properties.
+
+===== [PDF page 26] =====
+Chapter 1: Windows Internals Overview
+20
+Figure 1-12: Object properties in Process Explorer
+Notice that the dialog shown in figure 1-12 is for the object’s properties, rather than the handle’s. In other
+words, looking at an object’s properties from any handle that points to the same object shows the same
+information.
+The properties in figure 1-12 include the object’s name (if any), its type, a short description, its address
+in kernel memory, the number of open handles, and some specific object information, such as the state
+and type of the event object shown. Note that the References shown do not indicate the actual number
+
+===== [PDF page 27] =====
+Chapter 1: Windows Internals Overview
+21
+of outstanding references to the object (it does prior to Windows 8.1). A proper way to see the actual
+reference count for the object is to use the kernel debugger’s !trueref command, as shown here:
+lkd> !object 0xFFFFA08F948AC0B0
+Object: ffffa08f948ac0b0
+Type: (ffffa08f684df140) Event
+ObjectHeader: ffffa08f948ac080 (new version)
+HandleCount: 2
+PointerCount: 65535
+Directory Object: ffff90839b63a700
+Name: ShellDesktopSwitchEvent
+lkd> !trueref ffffa08f948ac0b0
+ffffa08f948ac0b0: HandleCount: 2 PointerCount: 65535 RealPointerCount: 3
+We’ll take a closer look at the attributes of objects and the kernel debugger in later chapters.
+In the next chapter, we’ll start writing a very simple driver to show and use many of the tools we’ll need
+later in this book.

@@ -1,0 +1,1654 @@
+CHAPTER 9: Process and Thread Notifications (PDF pages 268-312)
+
+===== [PDF page 268] =====
+Chapter 9: Process and Thread
+Notifications
+One of the powerful mechanisms available for kernel drivers is the ability to be notified when certain
+important events occur. In this chapter, we’ll look into some of these events, namely process creation and
+destruction, thread creation and destruction, and image loads.
+In this chapter:
+• Process Notifications
+• Implementing Process Notifications
+• Providing Data to User Mode
+• Thread Notifications
+• Image Load Notifications
+• Remote Thread Detection
+Process Notifications
+Whenever a process is created or destroyed, interested drivers can be notified by the kernel of that fact.
+This allows drivers to keep track of processes, possibly associating some data with these processes. At the
+very minimum, these allow drivers to monitor process creation/destruction in real-time. By “real-time”
+I mean that the notifications are sent “in-line”, as part of process creation; the driver cannot miss any
+processes that may be created and destroyed quickly.
+For process creation, drivers also have the power to stop the process from being fully created, returning
+an error to the caller that initiated process creation. This kind of power can only be directly achieved in
+kernel mode.
+Windows provides other mechanisms for being notified when processes are created or destroyed. For
+example, using Event Tracing for Windows (ETW), such notifications can be received by a user-mode
+process (running with elevated privileges). However, there is no way to prevent a process from being
+created. Furthermore, ETW has an inherent notification delay of about 1-3 seconds (it uses internal
+buffers for performance reasons), so a short-lived process may exit before the creation notification arrives.
+Opening a handle to the created process at that time would no longer be possible.
+
+===== [PDF page 269] =====
+Chapter 9: Process and Thread Notifications
+263
+The main API for registering for process notifications is PsSetCreateProcessNotifyRoutineEx,
+defined like so:
+NTSTATUS PsSetCreateProcessNotifyRoutineEx (
+_In_ PCREATE_PROCESS_NOTIFY_ROUTINE_EX NotifyRoutine,
+_In_ BOOLEAN Remove);
+There is currently a system-wide limit of 64 registrations, so it’s theoretically possible for the
+registration function to fail.
+The first argument is the driver’s callback routine, having the following prototype:
+void ProcessNotifyCallback(
+_Inout_
+PEPROCESS Process,
+_In_
+HANDLE ProcessId,
+_Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
+The second argument to PsSetCreateProcessNotifyRoutineEx indicates whether the driver is
+registering or unregistering the callback (FALSE indicates the former). Typically, a driver will call this
+API with FALSE in its DriverEntry routine and call the same API with TRUE in its Unload routine.
+The parameters to the process notification routine are as follows:
+• Process - the process object of the newly created process, or the process being destroyed.
+• Process Id - the unique process ID of the process. Although it’s declared with type HANDLE, it’s in
+fact an ID.
+• CreateInfo - a structure that contains detailed information on the process being created. If the process
+is being destroyed, this argument is NULL.
+For process creation, the driver’s callback routine is executed by the creating thread (running as part of
+the creating process). For process exit, the callback is executed by the last thread to exit the process. In
+both cases, the callback is called inside a critical region (where normal kernel APCs are disabled).
+Starting with Windows 10 version 1607, there is another function for process notifications:PsSetCreateProcessNotify
+This “extended” function sets up a callback similar to the previous one, but the callback is also invoked
+for Pico processes. Pico processes are those used to host Linux processes for the Windows Subsystem for
+Linux (WSL) version 1. If a driver is interested in such processes, it must register with the extended
+function.
+
+===== [PDF page 270] =====
+Chapter 9: Process and Thread Notifications
+264
+A driver using these callbacks must have the IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY flag
+in its Portable Executable (PE) image header. Without it, the call to the registration function returns
+STATUS_ACCESS_DENIED (unrelated to driver test signing mode). Currently, Visual Studio does not
+provide UI for setting this flag. It must be set in the linker command-line options with /integritycheck.
+Figure 9-1 shows the project properties where this setting is specified.
+Figure 9-1: /integritycheck linker switch in Visual Studio
+The data structure provided for process creation is defined like so:
+typedef struct _PS_CREATE_NOTIFY_INFO {
+_In_ SIZE_T Size;
+union {
+_In_ ULONG Flags;
+struct {
+_In_ ULONG FileOpenNameAvailable : 1;
+_In_ ULONG IsSubsystemProcess : 1;
+_In_ ULONG Reserved : 30;
+};
+
+===== [PDF page 271] =====
+Chapter 9: Process and Thread Notifications
+265
+};
+_In_ HANDLE ParentProcessId;
+_In_ CLIENT_ID CreatingThreadId;
+_Inout_ struct _FILE_OBJECT *FileObject;
+_In_ PCUNICODE_STRING ImageFileName;
+_In_opt_ PCUNICODE_STRING CommandLine;
+_Inout_ NTSTATUS CreationStatus;
+} PS_CREATE_NOTIFY_INFO, *PPS_CREATE_NOTIFY_INFO;
+Here is a description of the important fields in this structure:
+• CreatingThreadId - a combination of thread and process Id of the creator of the process.
+• ParentProcessId - the parent process ID (not a handle). This process is usually the same as provided
+by CreateThreadId.UniqueProcess, but may be different, as it’s possible, as part of process
+creation, to pass in a different parent process to inherit certain properties from. See the user-mode
+documentation for UpdateProcThreadAttribute with the PROC_THREAD_ATTRIBUTE_PAR-
+ENT_PROCESS attribute.
+• ImageFileName - the image file name of the executable, available if the flag FileOpenNameAvail-
+able is set.
+• CommandLine - the full command line used to create the process. Note that in some cases it may
+be NULL.
+• IsSubsystemProcess - this flag is set if this process is a Pico process. This can only happen if the
+driver registered using PsSetCreateProcessNotifyRoutineEx2.
+• CreationStatus - this is the status that would return to the caller. It’s set to STATUS_SUCCESS when
+the callback is invoked. This is where the driver can stop the process from being created by placing
+some failure status in this member (e.g. STATUS_ACCESS_DENIED). if the driver fails the creation,
+subsequent drivers that may have set up their own callbacks will not be called.
+Implementing Process Notifications
+To demonstrate process notifications, we’ll build a driver that gathers information on process creation
+and destruction and allow this information to be consumed by a user-mode client. This is similar to tools
+such as Process Monitor and SysMon from Sysinternals, which use process and thread notifications for
+reporting process and thread activity. During the course of implementing this driver, we’ll leverage some
+of the techniques we learned in previous chapters.
+Our driver name is going to be SysMon (unrelated to the SysMon tool). It will store all process
+creation/destruction information in a linked list. Since this linked list may be accessed concurrently by
+multiple threads, we need to protect it with a mutex or a fast mutex; we’ll go with fast mutex, as it’s
+slightly more efficient.
+The data we gather will eventually find its way to user mode, so we should declare common structures
+that the driver produces and a user-mode client consumes. We’ll add a common header file named
+SysMonPublic.h to the driver project and define a few structures. We start with a common header for
+all information structures we need to collect:
+
+===== [PDF page 272] =====
+Chapter 9: Process and Thread Notifications
+266
+enum class ItemType : short {
+None,
+ProcessCreate,
+ProcessExit
+};
+struct ItemHeader {
+ItemType Type;
+USHORT Size;
+LARGE_INTEGER Time;
+};
+The ItemType enum defined above uses the C++ 11 scoped enum feature, where enum values
+have a scope (ItemType in this case). These enums can also have a non-int size - short in
+the example. If you’re using C, you can use classic enums, or even #defines if you prefer.
+The ItemHeader structure holds information common to all event types: the type of the event, the time
+of the event (expressed as a 64-bit integer), and the size of the payload. The size is important, as each event
+has its own information. If we later wish to pack an array of these events and (say) provide them to a
+user-mode client, the client needs to know where each event ends and the next one begins.
+Once we have this common header, we can derive other data structures for particular events. Let’s start
+with the simplest - process exit:
+struct ProcessExitInfo : ItemHeader {
+ULONG ProcessId;
+ULONG ExitCode;
+};
+For process exit event, there is just one interesting piece of information (besides the header and the thread
+ID) - the exit status (code) of the process. This is normally the value returned from a user-mode main
+function.
+If you’re using C, then inheritance is not available to you. However, you can simulate it by
+having the first member be of type ItemHeader and then adding the specific members; The
+memory layout is the same.
+struct ProcessExitInfo {
+ItemHeader Header;
+ULONG ProcessId;
+};
+
+===== [PDF page 273] =====
+Chapter 9: Process and Thread Notifications
+267
+The type used for a process ID is ULONG - process IDs (and thread IDs) cannot be larger than 32-bit.
+HANDLE is not a good idea, as user mode may be confused by it. Also, HANDLE has a different size in a
+32-bit process as opposed to a 64-bit process, so it’s best to avoid “bitness”-affected members. If you’re
+familiar with user-mode programming, DWORD is a common typedef for a 32-bit unsigned integer. It’s
+not used here because DWORD is not defined in the WDK headers. Although it’s pretty easy to define it
+explicitly, it’s simpler just to use ULONG, which means the same thing and is defined in user-mode and
+kernel-mode headers.
+Since we need to store every such structure as part of a linked list, each data structure must contain a
+LIST_ENTRY instance that points to the next and previous items. Since these LIST_ENTRY objects should
+not be exposed to user-mode, we will define extended structures containing these entries in a different file,
+that is not shared with user-mode.
+There are several ways to define a “bigger” structure to hold the LIST_ENTRY. One way is to create
+templated type that has a LIST_ENTRY at the beginning (or end) like so:
+template<typename T>
+struct FullItem {
+LIST_ENTRY Entry;
+T Data;
+};
+The layout of FullItem<T> is shown in figure 9-2.
+Figure 9-2: FullItem<T> layout
+A templated class is used to avoid creating a multitude of types, one for each specific event type. For
+example, we could create the following structure specifically for a process exit event:
+
+===== [PDF page 274] =====
+Chapter 9: Process and Thread Notifications
+268
+struct FullProcessExitInfo {
+LIST_ENTRY Entry;
+ProcessExitInfo Data;
+};
+We could even inherit from LIST_ENTRY and then just add the ProcessExitInfo structure. But this
+is not elegant, as our data has nothing to do with LIST_ENTRY, so inheriting from it is artificial and
+should be avoided.
+The FullItem<T> type saves the hassle of creating these individual types.
+IF you’re using C, then templates are not available, and you must use the above structure
+approach. I’m not going to mention C again in this chapter - there is always a workaround that
+can be used if you have to.
+Another way to accomplish something similar, without using templates is by using a union to hold on to
+all the possible variants. For example:
+struct ItemData : ItemHeader {
+union {
+ProcessCreateInfo ProcessCreate;
+// TBD
+ProcessExitInfo ProcessExit;
+};
+};
+Then we just extend the list of data members in the union. The full item would be just a simple extension:
+struct FullItem {
+LIST_ENTRY Entry;
+ItemData Data;
+};
+The rest of the code uses the first option (with the template). The reader is encouraged to try the second
+option.
+The head of our linked list must be stored somewhere. We’ll create a data structure that will hold all
+the global state of the driver, instead of creating separate global variables. Here is the definition of our
+structure (in Globals.h in the smaple code for this chapter):
+
+===== [PDF page 275] =====
+Chapter 9: Process and Thread Notifications
+269
+#include "FastMutex.h"
+struct Globals {
+void Init(ULONG maxItems);
+bool AddItem(LIST_ENTRY* entry);
+LIST_ENTRY* RemoveItem();
+private:
+LIST_ENTRY m_ItemsHead;
+ULONG m_Count;
+ULONG m_MaxCount;
+FastMutex m_Lock;
+};
+The FastMutex type used is the same one we developed in chapter 6.
+Init is used to initialize the data members of the structure. Here is its implementation (in Globals.cpp):
+void Globals::Init(ULONG maxCount) {
+InitializeListHead(&m_ItemsHead);
+m_Lock.Init();
+m_Count = 0;
+m_MaxCount = maxCount;
+}
+m_MaxCount holds the maximum number of elements in the linked list. This will be used to prevent
+the list from growing arbitrarily large if a client does not request data for a while. m_Count holds the
+current number of items in the list. The list itself is initialized with the normal InitializeListHead
+API. Finally, the fast mutex is initialized by invoking its own Init method as implemented in chapter 6.
+The DriverEntry Routine
+The DriverEntry for the SysMon driver is similar to the one in the Zero driver from chapter 7. We have
+to add process notification registration and proper initialization of our Globals object:
+// in SysMon.cpp
+Globals g_State;
+extern "C"
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
+auto status = STATUS_SUCCESS;
+PDEVICE_OBJECT DeviceObject = nullptr;
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\sysmon");
+
+===== [PDF page 276] =====
+Chapter 9: Process and Thread Notifications
+270
+bool symLinkCreated = false;
+do {
+UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\sysmon");
+status = IoCreateDevice(DriverObject, 0, &devName,
+FILE_DEVICE_UNKNOWN, 0, TRUE, &DeviceObject);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to create device (0x%08X)\n",
+status));
+break;
+}
+DeviceObject->Flags |= DO_DIRECT_IO;
+status = IoCreateSymbolicLink(&symLink, &devName);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to create sym link (0x%08X)\n",
+status));
+break;
+}
+symLinkCreated = true;
+status = PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX
+"failed to register process callback (0x%08X)\n",
+status));
+break;
+}
+} while (false);
+if (!NT_SUCCESS(status)) {
+if (symLinkCreated)
+IoDeleteSymbolicLink(&symLink);
+if (DeviceObject)
+IoDeleteDevice(DeviceObject);
+return status;
+}
+g_State.Init(10000);
+// hard-coded limit for now
+DriverObject->DriverUnload = SysMonUnload;
+DriverObject->MajorFunction[IRP_MJ_CREATE] =
+DriverObject->MajorFunction[IRP_MJ_CLOSE] = SysMonCreateClose;
+
+===== [PDF page 277] =====
+Chapter 9: Process and Thread Notifications
+271
+DriverObject->MajorFunction[IRP_MJ_READ] = SysMonRead;
+return status;
+}
+The device object’s flags are adjusted to use Direct I/O for read/write operations (DO_DIRECT_IO). The
+device is created as exclusive, so that only a single client can exist to the device. This makes sense, otherwise
+multiple clients might be getting data from the device, which would mean each client getting parts of the
+data. In this case, I decided to prevent that by creating the device as exclusive (TRUE value in the second
+to last argument). We’ll use the read dispatch routine to return event information to a client.
+The create and close dispatch routines are handled in the simplest possible way - just completing them
+successfully, with the help of CompleteRequest we have encountered before:
+NTSTATUS CompleteRequest(PIRP Irp,
+NTSTATUS status = STATUS_SUCCESS, ULONG_PTR info = 0) {
+Irp->IoStatus.Status = status;
+Irp->IoStatus.Information = info;
+IoCompleteRequest(Irp, IO_NO_INCREMENT);
+return status;
+}
+NTSTATUS SysMonCreateClose(PDEVICE_OBJECT, PIRP Irp) {
+return CompleteRequest(Irp);
+}
+Handling Process Exit Notifications
+The process notification function in the code above is OnProcessNotify and has the prototype outlined
+earlier in this chapter. This callback handles process creation and exit. Let’s start with process exit, as it’s
+much simpler than process creation (as we shall soon see). The basic outline of the callback is as follows:
+void OnProcessNotify(PEPROCESS Process, HANDLE ProcessId,
+PPS_CREATE_NOTIFY_INFO CreateInfo) {
+if (CreateInfo) {
+// process create
+}
+else {
+// process exit
+}
+}
+For process exit we have just the process ID we need to save, along with the header data common to all
+events. First, we need to allocate storage for the full item representing this event:
+
+===== [PDF page 278] =====
+Chapter 9: Process and Thread Notifications
+272
+auto info = (FullItem<ProcessExitInfo>*)ExAllocatePoolWithTag(PagedPool,
+sizeof(FullItem<ProcessExitInfo>), DRIVER_TAG);
+if (info == nullptr) {
+KdPrint((DRIVER_PREFIX "failed allocation\n"));
+return;
+}
+If the allocation fails, there is really nothing the driver can do, so it just returns from the callback.
+Now it’s time to fill the generic information: time, item type and size, all of which are easy to get:
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+item.Type = ItemType::ProcessExit;
+item.Size = sizeof(ProcessExitInfo);
+item.ProcessId = HandleToULong(ProcessId);
+item.ExitCode = PsGetProcessExitStatus(Process);
+PushItem(&info->Entry);
+First, we dig into the data item itself (bypassing the LIST_ENTRY) with the item variable. Next, we
+fill the header information: The item type is well-known, since we are in the branch handling a process
+exit notification; the time can be obtained with KeQuerySystemTimePrecise that returns the current
+system time (UTC, not local time) as a 64-bit integer counting from January 1, 1601 at midnight Universal
+Time. Finally, the item size is constant and is the size of the user-facing data structure (not the size of the
+FullItem<ProcessExitInfo>).
+Notice the item variable is a reference to the data; without the reference (&), a copy would
+have been created, which is not what we want.
+The KeQuerySystemTimePrecise API is available starting with Windows 8. For earlier
+versions, the KeQuerySystemTime API should be used instead.
+The specific data for a process exit event consists of the process ID and the exit code. The process ID is
+provided directly by the callback itself. The only thing to do is call HandleToULong so the correct cast
+is used to turn a HANDLE value into an unsigned 32-bit integer. The exit code is not given directly, but it’s
+easy to retrieve with PsGetProcessExitStatus:
+NTSTATUS PsGetProcessExitStatus(_In_ PEPROCESS Process);
+All that’s left to do now is add the new item to the end of our linked list. For this purpose, we’ll define and
+implement a function named AddItem in the Globals class:
+
+===== [PDF page 279] =====
+Chapter 9: Process and Thread Notifications
+273
+void Globals::AddItem(LIST_ENTRY* entry) {
+Locker locker(m_Lock);
+if (m_Count == m_MaxCount) {
+auto head = RemoveHeadList(&m_ItemsHead);
+ExFreePool(CONTAINING_RECORD(head,
+FullItem<ItemHeader>, Entry));
+m_Count--;
+}
+InsertTailList(&m_ItemsHead, entry);
+m_Count++;
+}
+AddItem uses the Locker<T> we saw in earlier chapters to acquire the fast mutex (and release it when
+the variable goes out of scope) before manipulating the linked list. Remember to set the C++ standard to
+C++ 17 at least in the project’s properties so that Locker can be used without explicitly specifying the
+type it works on (the compiler makes the inference).
+We’ll add new items to the tail of the list. If the number of items in the list is at its maximum, the function
+removes the first item (from the head) and frees it with ExFreePool, decrementing the item count.
+This is not the only way to handle the case where the number of items is too large. Feel free to use other
+ways. A more “precise” way might be tracking the number of bytes used, rather than number of items,
+because each item is different in size.
+We don’t need to use atomic increment/decrement operations in the AddItem function because
+manipulation of the item count is always done under the protection of the fast mutex.
+With AddItem implemented, we can call it from our process notify routine:
+g_State.AddItem(&info->Entry);
+Implement the limit by reading from the registry in DriverEntry. Hint: you can use APIs
+such as ZwOpenKey or IoOpenDeviceRegistryKey and then ZwQueryValueKey. We’ll
+look at these APIs more closely in chapter 11.
+
+===== [PDF page 280] =====
+Chapter 9: Process and Thread Notifications
+274
+Handling Process Create Notifications
+Process create notifications are more complex because the amount of information varies. The command
+line length is different for different processes. First we need to decide what information to store for process
+creation. Here is a first try:
+struct ProcessCreateInfo : ItemHeader {
+ULONG ProcessId;
+ULONG ParentProcessId;
+WCHAR CommandLine[1024];
+};
+We choose to store the process ID, the parent process ID and the command line. Although this structure
+can work and is fairly easy to deal with because its size is known in advance.
+What might be an issue with the above declaration?
+The potential issue here is with the command line. Declaring the command line with constant size is simple,
+but not ideal. If the command line is longer than allocated, the driver would have to trim it, possibly hiding
+important information. If the command line is shorter than the defined limit, the structure is wasting
+memory.
+Can we use something like this?
+struct ProcessCreateInfo : ItemHeader {
+ULONG ProcessId;
+ULONG ParentProcessId;
+UNICODE_STRING CommandLine;
+// can this work?
+};
+This cannot work. First, UNICODE_STRING is not normally defined in user mode headers. Secondly
+(and much worse), the internal pointer to the actual characters normally would point to system space,
+inaccessible to user-mode. Thirdly, how would that string be eventually freed?
+Here is another option, which we’ll use in our driver:
+
+===== [PDF page 281] =====
+Chapter 9: Process and Thread Notifications
+275
+struct ProcessCreateInfo : ItemHeader {
+ULONG ProcessId;
+ULONG ParentProcessId;
+ULONG CreatingThreadId;
+ULONG CreatingProcessId;
+USHORT CommandLineLength;
+WCHAR CommandLine[1];
+};
+We’ll store the command line length and copy the actual characters at the end of the structure, starting
+from CommandLine. The array size is specified as 1 just to make it easier to work with in the code. The
+actual number of characters is provided by CommandLineLength.
+Given this declaration, we can begin implementation for process creation (CreateInfo is non-NULL):
+USHORT allocSize = sizeof(FullItem<ProcessCreateInfo>);
+USHORT commandLineSize = 0;
+if (CreateInfo->CommandLine) {
+commandLineSize = CreateInfo->CommandLine->Length;
+allocSize += commandLineSize;
+}
+auto info = (FullItem<ProcessCreateInfo>*)ExAllocatePoolWithTag(
+PagedPool, allocSize, DRIVER_TAG);
+if (info == nullptr) {
+KdPrint((DRIVER_PREFIX "failed allocation\n"));
+return;
+}
+The total size for an allocation is based on the command line length (if any). Now it’s time to fill in the
+fixed-size details:
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+item.Type = ItemType::ProcessCreate;
+item.Size = sizeof(ProcessCreateInfo) + commandLineSize;
+item.ProcessId = HandleToULong(ProcessId);
+item.ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+item.CreatingProcessId = HandleToULong(
+CreateInfo->CreatingThreadId.UniqueProcess);
+item.CreatingThreadId = HandleToULong(
+CreateInfo->CreatingThreadId.UniqueThread);
+The item size must be calculated to include the command line length.
+Next, we need to copy the command line to the address where CommandLine begins, and set the correct
+command line length:
+
+===== [PDF page 282] =====
+Chapter 9: Process and Thread Notifications
+276
+if (commandLineSize > 0) {
+memcpy(item.CommandLine, CreateInfo->CommandLine->Buffer, commandLineSize);
+item.CommandLineLength = commandLineSize / sizeof(WCHAR); // len in WCHARs
+}
+else {
+item.CommandLineLength = 0;
+}
+g_State.AddItem(&info->Entry);
+The command line length is stored in characters, rather than bytes. This is not mandatory, of course, but
+would probably be easier to use by user mode code. Notice the command line is not NULL terminated - it’s
+up to the client not read too many characters. As an alternative, we can make the string null terminated
+to simplify client code. In fact, if we do that, the command line length is not even needed.
+Make the command line NULL-terminated and remove the command line length.
+Astute readers may notice that the calculated data length is actually one character longer
+than needed, perfect for adding a NULL-terminator. Why? sizeof(ProcessCreateInfo)
+includes one character of the command line.
+For easier reference, here is the complete process notify callback implementation:
+void OnProcessNotify(PEPROCESS Process, HANDLE ProcessId,
+PPS_CREATE_NOTIFY_INFO CreateInfo) {
+if (CreateInfo) {
+USHORT allocSize = sizeof(FullItem<ProcessCreateInfo>);
+USHORT commandLineSize = 0;
+if (CreateInfo->CommandLine) {
+commandLineSize = CreateInfo->CommandLine->Length;
+allocSize += commandLineSize;
+}
+auto info = (FullItem<ProcessCreateInfo>*)ExAllocatePoolWithTag(
+PagedPool, allocSize, DRIVER_TAG);
+if (info == nullptr) {
+KdPrint((DRIVER_PREFIX "failed allocation\n"));
+return;
+}
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+
+===== [PDF page 283] =====
+Chapter 9: Process and Thread Notifications
+277
+item.Type = ItemType::ProcessCreate;
+item.Size = sizeof(ProcessCreateInfo) + commandLineSize;
+item.ProcessId = HandleToULong(ProcessId);
+item.ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+item.CreatingProcessId = HandleToULong(
+CreateInfo->CreatingThreadId.UniqueProcess);
+item.CreatingThreadId = HandleToULong(
+CreateInfo->CreatingThreadId.UniqueThread);
+if (commandLineSize > 0) {
+memcpy(item.CommandLine, CreateInfo->CommandLine->Buffer,
+commandLineSize);
+item.CommandLineLength = commandLineSize / sizeof(WCHAR);
+}
+else {
+item.CommandLineLength = 0;
+}
+g_State.AddItem(&info->Entry);
+}
+else {
+auto info = (FullItem<ProcessExitInfo>*)ExAllocatePoolWithTag(
+PagedPool, sizeof(FullItem<ProcessExitInfo>), DRIVER_TAG);
+if (info == nullptr) {
+KdPrint((DRIVER_PREFIX "failed allocation\n"));
+return;
+}
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+item.Type = ItemType::ProcessExit;
+item.ProcessId = HandleToULong(ProcessId);
+item.Size = sizeof(ProcessExitInfo);
+item.ExitCode = PsGetProcessExitStatus(Process);
+g_State.AddItem(&info->Entry);
+}
+}
+Providing Data to User Mode
+The next thing to consider is how to provide the gathered information to a user-mode client. There are
+several options that could be used, but for this driver we’ll let the client poll the driver for information
+
+===== [PDF page 284] =====
+Chapter 9: Process and Thread Notifications
+278
+using a read request. The driver will fill the user-provided buffer with as many events as possible, until
+either the buffer is exhausted or there are no more events in the queue.
+We’ll start the read request by obtaining the address of the user’s buffer with Direct I/O (set up in
+DriverEntry):
+NTSTATUS SysMonRead(PDEVICE_OBJECT, PIRP Irp) {
+auto irpSp = IoGetCurrentIrpStackLocation(Irp);
+auto len = irpSp->Parameters.Read.Length;
+auto status = STATUS_SUCCESS;
+ULONG bytes = 0;
+NT_ASSERT(Irp->MdlAddress);
+// we're using Direct I/O
+auto buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(
+Irp->MdlAddress, NormalPagePriority);
+if (!buffer) {
+status = STATUS_INSUFFICIENT_RESOURCES;
+}
+Now we need to access our linked list and pull items from its head. We’ll add this support to the Global
+class by implementing a method that removed an item from the head and returns it. If the list is empty, it
+returns NULL:
+LIST_ENTRY* Globals::RemoveItem() {
+Locker locker(m_Lock);
+auto item = RemoveHeadList(&m_ItemsHead);
+if (item == &m_ItemsHead)
+return nullptr;
+m_Count--;
+return item;
+}
+If the linked list is empty, RemoveHeadList returns the head itself. It’s also possible to use IsListEmpty
+to make that determination. Lastly, we can check if m_Count is zero - all these are equivalent. If there is
+an item, it’s returned as a LIST_ENTRY pointer.
+Back to the Read dispatch routine - we can now loop around, getting an item out, copying its data to the
+user-mode buffer, until the list is empty or the buffer is full:
+
+===== [PDF page 285] =====
+Chapter 9: Process and Thread Notifications
+279
+else {
+while (true) {
+auto entry = g_State.RemoveItem();
+if (entry == nullptr)
+break;
+//
+// get pointer to the actual data item
+//
+auto info = CONTAINING_RECORD(entry, FullItem<ItemHeader>, Entry);
+auto size = info->Data.Size;
+if (len < size) {
+//
+// user's buffer too small, insert item back
+//
+g_State.AddHeadItem(entry);
+break;
+}
+memcpy(buffer, &info->Data, size);
+len -= size;
+buffer += size;
+bytes += size;
+ExFreePool(info);
+}
+}
+return CompleteRequest(Irp, status, bytes);
+Globals::RemoveItem is called to retrieve the head item (if any). Then we have to check if the
+remaining bytes in the user’s buffer are enough to contain the data of this item. If not, we have to push
+the item back to the head of the queue, accomplished with another method in the Globals class:
+void Globals::AddHeadItem(LIST_ENTRY* entry) {
+Locker locker(m_Lock);
+InsertHeadList(&m_ItemsHead, entry);
+m_Count++;
+}
+If there is enough room in the buffer, a simple memcpy is used to copy the actual data (everything except
+the LIST_ENTRY to the user’s buffer). Finally, the variables are adjusted based on the size of this item and
+the loop repeats.
+Once out of the loop, the only thing remaining is to complete the request with whatever status and
+information (bytes) have been accumulated thus far.
+We need to take a look at the unload routine as well. If there are items in the linked list, they must be freed
+explicitly; otherwise, we have a leak on our hands:
+
+===== [PDF page 286] =====
+Chapter 9: Process and Thread Notifications
+280
+void SysMonUnload(PDRIVER_OBJECT DriverObject) {
+PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
+LIST_ENTRY* entry;
+while ((entry = g_State.RemoveItem()) != nullptr)
+ExFreePool(CONTAINING_RECORD(entry, FullItem<ItemHeader>, Entry));
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\sysmon");
+IoDeleteSymbolicLink(&symLink);
+IoDeleteDevice(DriverObject->DeviceObject);
+}
+The linked list items are freed by repeatedly removing items from the list and calling ExFreePool on
+each item.
+The User Mode Client
+Once we have all this in place, we can write a user mode client that polls data using ReadFile and
+displays the results.
+The main function calls ReadFile in a loop, sleeping a bit so that the thread is not always consuming
+CPU. Once some data arrives, it’s sent for display purposes:
+#include <Windows.h>
+#include <stdio.h>
+#include <memory>
+#include <string>
+#include "..\SysMon\SysMonPublic.h"
+int main() {
+auto hFile = CreateFile(L"\\\\.\\SysMon", GENERIC_READ, 0,
+nullptr, OPEN_EXISTING, 0, nullptr);
+if (hFile == INVALID_HANDLE_VALUE)
+return Error("Failed to open file");
+int size = 1 << 16;
+// 64 KB
+auto buffer = std::make_unique<BYTE[]>(size);
+while (true) {
+DWORD bytes = 0;
+// error handling omitted
+ReadFile(hFile, buffer.get(), size, &bytes, nullptr);
+if (bytes)
+
+===== [PDF page 287] =====
+Chapter 9: Process and Thread Notifications
+281
+DisplayInfo(buffer.get(), bytes);
+// wait a bit before polling again
+Sleep(400);
+}
+// never actually reached
+CloseHandle(hFile);
+return 0;
+}
+The DisplayInfo function must make sense of the buffer it’s given. Since all events start with a common
+header, the function distinguishes the various events based on the ItemType. After the event has been
+dealt with, the Size field in the header indicates where the next event starts:
+void DisplayInfo(BYTE* buffer, DWORD size) {
+while (size > 0) {
+auto header = (ItemHeader*)buffer;
+switch (header->Type) {
+case ItemType::ProcessExit:
+{
+DisplayTime(header->Time);
+auto info = (ProcessExitInfo*)buffer;
+printf("Process %u Exited (Code: %u)\n",
+info->ProcessId, info->ExitCode);
+break;
+}
+case ItemType::ProcessCreate:
+{
+DisplayTime(header->Time);
+auto info = (ProcessCreateInfo*)buffer;
+std::wstring commandline(info->CommandLine,
+info->CommandLineLength);
+printf("Process %u Created. Command line: %ws\n",
+info->ProcessId, commandline.c_str());
+break;
+}
+}
+buffer += header->Size;
+size -= header->Size;
+}
+
+===== [PDF page 288] =====
+Chapter 9: Process and Thread Notifications
+282
+}
+To extract the command line properly, the code uses the C++ wstring class constructor that can build a
+string based on a pointer and the string length. The DisplayTime helper function formats the time in a
+human-readable way:
+void DisplayTime(const LARGE_INTEGER& time) {
+//
+// LARGE_INTEGER and FILETIME have the same size
+// representing the same format in our case
+//
+FILETIME local;
+//
+// convert to local time first (KeQuerySystemTime(Procise) returns UTC)
+//
+FileTimeToLocalFileTime((FILETIME*)&time, &local);
+SYSTEMTIME st;
+FileTimeToSystemTime(&local, &st);
+printf("%02d:%02d:%02d.%03d: ",
+st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+}
+SYSTEMTIME is a convenient structure to work with, as it contains all ingredients of a date and time. In
+the above code, only the time is displayed, but the date components are present as well.
+That’s all we need to begin testing the driver and the client.
+The driver can be installed and started as done in earlier chapters, similar to the following:
+sc create sysmon type= kernel binPath= C:\Test\SysMon.sys
+sc start sysmon
+Here is some sample output when running SysMonClient.exe:
+16:18:51.961: Process 13124 Created. Command line: "C:\Program Files (x86)\Micr\
+osoft\Edge\Application\97.0.1072.62\identity_helper.exe" --type=utility --utili\
+ty-sub-type=winrt_app_id.mojom.WinrtAppIdService --field-trial-handle=2060,1091\
+8786588500781911,4196358801973005731,131072 --lang=en-US --service-sandbox-type\
+=none --mojo-platform-channel-handle=5404 /prefetch:8
+16:18:51.967: Process 13124 Exited (Code: 3221226029)
+16:18:51.969: Process 6216 Created. Command line: "C:\Program Files (x86)\Micro\
+soft\Edge\Application\97.0.1072.62\identity_helper.exe" --type=utility --utilit\
+
+===== [PDF page 289] =====
+Chapter 9: Process and Thread Notifications
+283
+y-sub-type=winrt_app_id.mojom.WinrtAppIdService --field-trial-handle=2060,10918\
+786588500781911,4196358801973005731,131072 --lang=en-US --service-sandbox-type=\
+none --mojo-platform-channel-handle=5404 /prefetch:8
+16:18:53.836: Thread 12456 Created in process 10720
+16:18:58.159: Process 10404 Exited (Code: 1)
+16:19:02.033: Process 6216 Exited (Code: 0)
+16:19:28.163: Process 9360 Exited (Code: 0)
+Thread Notifications
+The kernel provides thread creation and destruction callbacks, similarly to process callbacks. The API to
+use for registration is PsSetCreateThreadNotifyRoutine and for unregistering there is another API,
+PsRemoveCreateThreadNotifyRoutine:
+NTSTATUS PsSetCreateThreadNotifyRoutine(
+_In_ PCREATE_THREAD_NOTIFY_ROUTINE NotifyRoutine);
+NTSTATUS PsRemoveCreateThreadNotifyRoutine (
+_In_ PCREATE_THREAD_NOTIFY_ROUTINE NotifyRoutine);
+The arguments provided to the callback routine are the process ID, thread ID and whether the thread is
+being created or destroyed:
+typedef void (*PCREATE_THREAD_NOTIFY_ROUTINE)(
+_In_ HANDLE ProcessId,
+_In_ HANDLE ThreadId,
+_In_ BOOLEAN Create);
+If a thread is created, the callback is executed by the creator thread; if the thread exits, the callback executes
+on that thread.
+We’ll extend the existing SysMon driver to receive thread notifications as well as process notifications.
+First, we’ll add enum values for thread events and a structure representing the information, all in the
+SysMonCommon.h header file:
+enum class ItemType : short {
+None,
+ProcessCreate,
+ProcessExit,
+ThreadCreate,
+ThreadExit
+};
+struct ThreadCreateInfo : ItemHeader {
+
+===== [PDF page 290] =====
+Chapter 9: Process and Thread Notifications
+284
+ULONG ThreadId;
+ULONG ProcessId;
+};
+struct ThreadExitInfo : ThreadCreateInfo {
+ULONG ExitCode;
+};
+It’s convenient to have ThreadExitInfo inherit from ThreadCreateInfo, as they share the thread
+and process IDs. It’s certainly not mandatory, but it makes the thread notification callback a bit simpler to
+write.
+Now we can add the proper registration to DriverEntry, right after registering for process notifications:
+status = PsSetCreateThreadNotifyRoutine(OnThreadNotify);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to set thread callbacks (0x%08X)\n",
+status));
+break;
+}
+Conversley, a call to PsRemoveCreateThreadNotifyRoutine is needed in the Unload routine:
+// in SysMonUnload
+PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
+The callback routine itself is simpler than the process notification callback, since the event structures have
+fixed sizes. Here is the thread callback routine in its entirety:
+void OnThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
+//
+// handle create and exit with the same code block, tweaking as needed
+//
+auto size = Create ? sizeof(FullItem<ThreadCreateInfo>)
+: sizeof(FullItem<ThreadExitInfo>);
+auto info = (FullItem<ThreadExitInfo>*)ExAllocatePoolWithTag(
+PagedPool, size, DRIVER_TAG);
+if (info == nullptr) {
+KdPrint((DRIVER_PREFIX "Failed to allocate memory\n"));
+return;
+}
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+
+===== [PDF page 291] =====
+Chapter 9: Process and Thread Notifications
+285
+item.Size = Create ? sizeof(ThreadCreateInfo) : sizeof(ThreadExitInfo);
+item.Type = Create ? ItemType::ThreadCreate : ItemType::ThreadExit;
+item.ProcessId = HandleToULong(ProcessId);
+item.ThreadId = HandleToULong(ThreadId);
+if (!Create) {
+PETHREAD thread;
+if (NT_SUCCESS(PsLookupThreadByThreadId(ThreadId, &thread))) {
+item.ExitCode = PsGetThreadExitStatus(thread);
+ObDereferenceObject(thread);
+}
+}
+g_State.AddItem(&info->Entry);
+}
+Most of this code should look pretty familiar. The slightly complex part if retrieving the thread exit code.
+PsGetThreadExitStatus can be used for that, but that API requires a thread object pointer rather
+than an ID. PsLookupThreadByThreadId is used to obtain the thread object that is passed to
+PsGetThreadExitStatus. It’s important to remember to call ObDereferenceObject on the thread
+object or else it will linger in memory until the next system restart.
+To complete the implementation, we’ll add code to the client that knows how to display thread creation
+and destruction (in the switch block inside DisplayInfo):
+case ItemType::ThreadCreate:
+{
+DisplayTime(header->Time);
+auto info = (ThreadCreateInfo*)buffer;
+printf("Thread %u Created in process %u\n",
+info->ThreadId, info->ProcessId);
+break;
+}
+case ItemType::ThreadExit:
+{
+DisplayTime(header->Time);
+auto info = (ThreadExitInfo*)buffer;
+printf("Thread %u Exited from process %u (Code: %u)\n",
+info->ThreadId, info->ProcessId, info->ExitCode);
+break;
+}
+Here is some sample output given the updated driver and client:
+
+===== [PDF page 292] =====
+Chapter 9: Process and Thread Notifications
+286
+16:19:41.500: Thread 10512 Created in process 9304
+16:19:41.500: Thread 10512 Exited from process 9304 (Code: 0)
+16:19:41.500: Thread 4424 Exited from process 9304 (Code: 0)
+16:19:41.501: Thread 10180 Exited from process 9304 (Code: 0)
+16:19:41.777: Process 14324 Created. Command line: "C:\WINDOWS\system32\defrag.\
+exe" -p bf8 -s 00000000000003BC -b -OnlyPreferred C:
+16:19:41.777: Thread 8120 Created in process 14324
+16:19:41.780: Process 11572 Created. Command line: \??\C:\WINDOWS\system32\conh\
+ost.exe 0xffffffff -ForceV1
+16:19:41.780: Thread 7952 Created in process 11572
+16:19:41.784: Thread 8748 Created in process 11572
+16:19:41.784: Thread 6408 Created in process 11572
+Add client code that displays the process image name for thread create and exit.
+Windows 10 adds another registration function that provides additional flexibility.
+typedef enum _PSCREATETHREADNOTIFYTYPE {
+PsCreateThreadNotifyNonSystem = 0,
+PsCreateThreadNotifySubsystems = 1
+} PSCREATETHREADNOTIFYTYPE;
+NTSTATUS PsSetCreateThreadNotifyRoutineEx(
+_In_ PSCREATETHREADNOTIFYTYPE NotifyType,
+_In_ PVOID NotifyInformation);
+// PCREATE_THREAD_NOTIFY_ROUTINE
+Using PsCreateThreadNotifyNonSystem indicates the callback for new threads should execute on
+the newly created thread, rather than the creator.
+Image Load Notifications
+The last callback mechanism we’ll look at in this chapter is image load notifications. Whenever a PE image
+(EXE, DLL, driver) file loads, the driver can receive a notification.
+The PsSetLoadImageNotifyRoutine API registers for these notifications, and PsRemoveImageNo-
+tifyRoutine is used for unregistering:
+
+===== [PDF page 293] =====
+Chapter 9: Process and Thread Notifications
+287
+NTSTATUS PsSetLoadImageNotifyRoutine(
+_In_ PLOAD_IMAGE_NOTIFY_ROUTINE NotifyRoutine);
+NTSTATUS PsRemoveLoadImageNotifyRoutine(
+_In_ PLOAD_IMAGE_NOTIFY_ROUTINE NotifyRoutine);
+The callback function has the following prototype:
+typedef void (*PLOAD_IMAGE_NOTIFY_ROUTINE)(
+_In_opt_ PUNICODE_STRING FullImageName,
+_In_ HANDLE ProcessId,
+// pid into which image is being mapped
+_In_ PIMAGE_INFO ImageInfo);
+Curiously enough, there is no callback mechanism for image unloads.
+The FullImageName argument is somewhat tricky. As indicated by the SAL annotation, it’s optional and
+can be NULL. Even if it’s not NULL, it doesn’t always produce the correct image file name before Windows
+10. The reasons for that are rooted deep in the kernel, it’s I/O system and the file system cache. In most
+cases, this works fine, and the format of the path is the internal NT format, starting with something like
+“\Device\HadrdiskVolumex\…” rather than “c:\…”. Translation can be done in a few ways, we’ll see one way
+when we look at the client code.
+The ProcessId argument is the process ID into which the image is loaded. For drivers (kernel modules),
+this value is zero.
+The ImageInfo argument contains additional information on the image, declared as follows:
+#define IMAGE_ADDRESSING_MODE_32BIT
+3
+typedef struct _IMAGE_INFO {
+union {
+ULONG Properties;
+struct {
+ULONG ImageAddressingMode
+: 8;
+// Code addressing mode
+ULONG SystemModeImage
+: 1;
+// System mode image
+ULONG ImageMappedToAllPids : 1;
+// Image mapped into all processes
+ULONG ExtendedInfoPresent
+: 1;
+// IMAGE_INFO_EX available
+ULONG MachineTypeMismatch
+: 1;
+// Architecture type mismatch
+ULONG resourcesignatureLevel
+: 4;
+// Signature level
+ULONG resourcesignatureType
+: 3;
+// Signature type
+ULONG ImagePartialMap
+: 1;
+// Nonzero if entire image is not \
+mapped
+
+===== [PDF page 294] =====
+Chapter 9: Process and Thread Notifications
+288
+ULONG Reserved
+: 12;
+};
+};
+PVOID
+ImageBase;
+ULONG
+resourceselector;
+SIZE_T
+resourcesize;
+ULONG
+resourcesectionNumber;
+} IMAGE_INFO, *PIMAGE_INFO;
+Here is quick rundown of the important fields in this structure:
+• SystemModeImage - this flag is set for a kernel image, and unset for a user mode image.
+• resourcesignatureLevel - signing level for Protected Processes Light (PPL) (Windows 8.1 and later).
+See SE_SIGNING_LEVEL_ constants in the WDK.
+• resourcesignatureType - signature type for PPL (Windows 8.1 and later). See the SE_IMAGE_SIG-
+NATURE_TYPE enumeration in the WDK.
+• ImageBase - the virtual address into which the image is loaded.
+• ImageSize - the size of the image.
+• ExtendedInfoPresent - if this flag is set, then IMAGE_INFO is part of a larger structure, IMAGE_-
+INFO_EX, shown here:
+typedef struct _IMAGE_INFO_EX {
+SIZE_T
+Size;
+IMAGE_INFO
+ImageInfo;
+struct _FILE_OBJECT *FileObject;
+} IMAGE_INFO_EX, *PIMAGE_INFO_EX;
+To access this larger structure, a driver can use the CONTAINING_RECORD macro like so:
+if (ImageInfo->ExtendedInfoPresent) {
+auto exinfo = CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
+// access FileObject
+}
+The extended structure adds just one meaningful member - the file object used to open the image. This
+may be useful for retrieving the file name in pre-WIndows 10 machines, as we’ll soon see.
+As with the process and thread notifications, we’ll add the needed code to register in DriverEntry and
+the code to unregister in the Unload routine. Here is the full DriverEntry function (with KdPrint calls
+removed for brevity):
+
+===== [PDF page 295] =====
+Chapter 9: Process and Thread Notifications
+289
+extern "C" NTSTATUS
+DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
+auto status = STATUS_SUCCESS;
+PDEVICE_OBJECT DeviceObject = nullptr;
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\sysmon");
+bool symLinkCreated = false;
+bool processCallbacks = false, threadCallbacks = false;
+do {
+UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\sysmon");
+status = IoCreateDevice(DriverObject, 0, &devName,
+FILE_DEVICE_UNKNOWN, 0, TRUE, &DeviceObject);
+if (!NT_SUCCESS(status)) {
+break;
+}
+DeviceObject->Flags |= DO_DIRECT_IO;
+status = IoCreateSymbolicLink(&symLink, &devName);
+if (!NT_SUCCESS(status)) {
+break;
+}
+symLinkCreated = true;
+status = PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
+if (!NT_SUCCESS(status)) {
+break;
+}
+processCallbacks = true;
+status = PsSetCreateThreadNotifyRoutine(OnThreadNotify);
+if (!NT_SUCCESS(status)) {
+break;
+}
+threadCallbacks = true;
+status = PsSetLoadImageNotifyRoutine(OnImageLoadNotify);
+if (!NT_SUCCESS(status)) {
+break;
+}
+} while (false);
+if (!NT_SUCCESS(status)) {
+
+===== [PDF page 296] =====
+Chapter 9: Process and Thread Notifications
+290
+if (threadCallbacks)
+PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
+if (processCallbacks)
+PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
+if (symLinkCreated)
+IoDeleteSymbolicLink(&symLink);
+if (DeviceObject)
+IoDeleteDevice(DeviceObject);
+return status;
+}
+g_State.Init(10000);
+DriverObject->DriverUnload = SysMonUnload;
+DriverObject->MajorFunction[IRP_MJ_CREATE] =
+DriverObject->MajorFunction[IRP_MJ_CLOSE] = SysMonCreateClose;
+DriverObject->MajorFunction[IRP_MJ_READ] = SysMonRead;
+return status;
+}
+We’ll add an event type to the ItemType enum:
+enum class ItemType : short {
+None,
+ProcessCreate,
+ProcessExit,
+ThreadCreate,
+ThreadExit,
+ImageLoad
+};
+As before, we need a structure to contain the information we can get from image load:
+const int MaxImageFileSize = 300;
+struct ImageLoadInfo : ItemHeader {
+ULONG ProcessId;
+ULONG ImageSize;
+ULONG64 LoadAddress;
+WCHAR ImageFileName[MaxImageFileSize + 1];
+};
+
+===== [PDF page 297] =====
+Chapter 9: Process and Thread Notifications
+291
+For variety, ImageLoadInfo uses a fixed size array to store the path to the image file. The interested
+reader should change that to use a scheme similar to process create notifications.
+The image load notification starts by not storing information on kernel images:
+void OnImageLoadNotify(PUNICODE_STRING FullImageName,
+HANDLE ProcessId, PIMAGE_INFO ImageInfo) {
+if (ProcessId == nullptr) {
+// system image, ignore
+return;
+}
+This is not necessary, of course. You can remove the above check so that kernel images are reported as
+well. Next, we allocate the data structure and fill in the usual information:
+auto size = sizeof(FullItem<ImageLoadInfo>);
+auto info = (FullItem<ImageLoadInfo>*)ExAllocatePoolWithTag(PagedPool, size, DR\
+IVER_TAG);
+if (info == nullptr) {
+KdPrint((DRIVER_PREFIX "Failed to allocate memory\n"));
+return;
+}
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+item.Size = sizeof(item);
+item.Type = ItemType::ImageLoad;
+item.ProcessId = HandleToULong(ProcessId);
+item.ImageSize = (ULONG)ImageInfo->ImageSize;
+item.LoadAddress = (ULONG64)ImageInfo->ImageBase;
+The interesting part is the image path. The simplest option is to examine FullImageName, and if non-
+NULL, just grab its contents. But since this information might be missing or not 100% reliable, we can try
+something else first, and fall back on FullImageName if all else fails.
+The secret is to use FltGetFileNameInformationUnsafe - a variant on FltGetFileNameInfor-
+mation that is used with File System Mini-filters, as we’ll see in chapter 12. The “Unsafe” version can be
+called in non-file-system contexts as is our case. A full discussion on FltGetFileNameInformation
+is saved for chapter 12. For now, let’s just use if the file object is available:
+
+===== [PDF page 298] =====
+Chapter 9: Process and Thread Notifications
+292
+item.ImageFileName[0] = 0;
+// assume no file information
+if (ImageInfo->ExtendedInfoPresent) {
+auto exinfo = CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
+PFLT_FILE_NAME_INFORMATION nameInfo;
+if (NT_SUCCESS(FltGetFileNameInformationUnsafe(exinfo->FileObject,
+nullptr, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+&nameInfo))) {
+// copy the file path
+wcscpy_s(item.ImageFileName, nameInfo->Name.Buffer);
+FltReleaseFileNameInformation(nameInfo);
+}
+}
+FltGetFileNameInformationUnsafe requires the file object that can be obtained from the extended
+IMAGE_INFO_EX structure. wcscpy_s ensures we don’t copy more characters than are available in the
+buffer. FltReleaseFileNameInformation must be called to free the PFLT_FILE_NAME_INFORMA-
+TION object allocated by FltGetFileNameInformationUnsafe.
+To gain access to these functions, add #include for <FltKernel.h> and add FlgMgr.lib into the Linker Input
+/ Additional Dependencies line.
+Finally, if this method does not produce a result, we fall back to using the provided image path:
+if (item.ImageFileName[0] == 0 && FullImageName) {
+wcscpy_s(item.ImageFileName, FullImageName->Buffer);
+}
+g_State.AddItem(&info->Entry);
+Here is the full image load notification code for easier reference (KdPrint removed):
+void OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_\
+INFO ImageInfo) {
+if (ProcessId == nullptr) {
+// system image, ignore
+return;
+}
+auto size = sizeof(FullItem<ImageLoadInfo>);
+auto info = (FullItem<ImageLoadInfo>*)ExAllocatePoolWithTag(
+
+===== [PDF page 299] =====
+Chapter 9: Process and Thread Notifications
+293
+PagedPool, size, DRIVER_TAG);
+if (info == nullptr)
+return;
+auto& item = info->Data;
+KeQuerySystemTimePrecise(&item.Time);
+item.Size = sizeof(item);
+item.Type = ItemType::ImageLoad;
+item.ProcessId = HandleToULong(ProcessId);
+item.ImageSize = (ULONG)ImageInfo->ImageSize;
+item.LoadAddress = (ULONG64)ImageInfo->ImageBase;
+item.ImageFileName[0] = 0;
+if (ImageInfo->ExtendedInfoPresent) {
+auto exinfo = CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
+PFLT_FILE_NAME_INFORMATION nameInfo;
+if (NT_SUCCESS(FltGetFileNameInformationUnsafe(
+exinfo->FileObject, nullptr,
+FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+&nameInfo))) {
+wcscpy_s(item.ImageFileName, nameInfo->Name.Buffer);
+FltReleaseFileNameInformation(nameInfo);
+}
+}
+if (item.ImageFileName[0] == 0 && FullImageName) {
+wcscpy_s(item.ImageFileName, FullImageName->Buffer);
+}
+g_State.AddItem(&info->Entry);
+}
+Final Client Code
+The client code must be extended for image loads. It seems easy enough except for one snag: the resulting
+image path retrieved in the image load notification is in NT Device form, instead of the more common,
+“DOS based” form with drive letters, which in fact are symbolic links. We can see these mappings in tools
+such as WinObj from Sysinternals (figure 9-3).
+
+===== [PDF page 300] =====
+Chapter 9: Process and Thread Notifications
+294
+Figure 9-3: Symbolic links in WinObj
+Notice the device name targets for C: and D: in figure 9-3. A file like c:\temp\mydll.dll will be reported as
+\Device\DeviceHarddiskVolume3\temp\mydll.dll. It would be nice if the display would show the common
+mappings instead of the NT device name.
+One way of getting these mappings is by calling QueryDosDevice, which retrieves the target of a
+symbolic link stored in the “??” Object Manager directory. We are already familiar with these symbolic
+links, as they are valid strings to the CreateFile API.
+Based on QueryDosDevice, we can loop over all existing drive letters and store the targets. Then, we
+can lookup every device name and find its drive letter (symbolic link). Here is a function to do that. If we
+can’t find a match, we’ll just return the original string:
+#include <unordered_map>
+std::wstring GetDosNameFromNTName(PCWSTR path) {
+if (path[0] != L'\\')
+return path;
+static std::unordered_map<std::wstring, std::wstring> map;
+if (map.empty()) {
+auto drives = GetLogicalDrives();
+int c = 0;
+WCHAR root[] = L"X:";
+WCHAR target[128];
+while (drives) {
+if (drives & 1) {
+root[0] = 'A' + c;
+if (QueryDosDevice(root, target, _countof(target))) {
+map.insert({ target, root });
+}
+}
+
+===== [PDF page 301] =====
+Chapter 9: Process and Thread Notifications
+295
+drives >>= 1;
+c++;
+}
+}
+auto pos = wcschr(path + 1, L'\\');
+if (pos == nullptr)
+return path;
+pos = wcschr(pos + 1, L'\\');
+if (pos == nullptr)
+return path;
+std::wstring ntname(path, pos - path);
+if (auto it = map.find(ntname); it != map.end())
+return it->second + std::wstring(pos);
+return path;
+}
+I will let the interested reader figure out how this code works. In any case, since user-mode is not the focus
+of this book, you can just use the function as is, as we’ll do in our client.
+Here is the part in DisplayInfo that handles image load notifications (within the switch):
+case ItemType::ImageLoad:
+{
+DisplayTime(header->Time);
+auto info = (ImageLoadInfo*)buffer;
+printf("Image loaded into process %u at address 0x%llX (%ws)\n",
+info->ProcessId, info->LoadAddress,
+GetDosNameFromNTName(info->ImageFileName).c_str());
+break;
+}
+Here is some example output when running the full driver and client:
+
+===== [PDF page 302] =====
+Chapter 9: Process and Thread Notifications
+296
+18:59:37.660: Image loaded into process 12672 at address 0x7FFD531C0000 (C:\Win\
+dows\System32\msvcp110_win.dll)
+18:59:37.661: Image loaded into process 12672 at address 0x7FFD5BF30000 (C:\Win\
+dows\System32\advapi32.dll)
+18:59:37.676: Thread 11416 Created in process 5820
+18:59:37.676: Thread 12496 Created in process 4824
+18:59:37.731: Thread 6636 Created in process 3852
+18:59:37.731: Image loaded into process 12672 at address 0x7FFD59F70000 (C:\Win\
+dows\System32\ntmarta.dll)
+18:59:37.735: Image loaded into process 12672 at address 0x7FFD51340000 (C:\Win\
+dows\System32\policymanager.dll)
+18:59:37.735: Image loaded into process 12672 at address 0x7FFD531C0000 (C:\Win\
+dows\System32\msvcp110_win.dll)
+18:59:37.737: Image loaded into process 12672 at address 0x7FFD51340000 (C:\Win\
+dows\System32\policymanager.dll)
+18:59:37.737: Image loaded into process 12672 at address 0x7FFD531C0000 (C:\Win\
+dows\System32\msvcp110_win.dll)
+18:59:37.756: Thread 6344 Created in process 704
+Add the process name in image load notifications.
+Create a driver that monitors process creation and allows a client application to configure
+executable paths that should not be allowed to execute.
+Remote Thread Detection
+One interesting example of using process and thread notifications is to detect remote threads. A remote
+thread is one that is created (injected) to a process different than its creator. This fairly well-known
+technique can be used (for example) to force the new thread to load a DLL, essentially injecting that
+DLL into another process.
+This scenario is not necessarily malicious, but it could be. The most common example where this happens
+is when a debugger attaches to a target and wants to break into the target. This is done by creating a
+thread in the target process (by the debugger process) and pointing the thread function to an API such as
+DebugBreak that forces a breakpoint, allowing the debugger to gain control.
+Anti-malware systems know how to detect these scenarios, as these may be malicious. Let’s build a driver
+that can make that kind of detection. At first, it seems to be very simple: when a thread is created, compare
+its creator’s process ID with the target process where the thread is created, and if they are different - you
+have a remote thread on your hands.
+There is a small dent in the above description. The first thread in any process is “remote” by definition,
+because it’s created by some other process (typically the one calling CreateProcess), so this “natural”
+occurrence should not be considered a remote thread creation.
+
+===== [PDF page 303] =====
+Chapter 9: Process and Thread Notifications
+297
+If you feel up to it, code this driver on your own!
+The core of the driver are process and thread notification callbacks. The most important is the thread
+creation callback, where the driver’s job is to determine whether a created thread is a remote one or not.
+We must keep an eye for new processes as well, because the first thread in a new process is technically
+remote, but we need to ignore it.
+The data maintained by the driver and later provided to the client contains the following (DetectorPublic.h):
+struct RemoteThread {
+LARGE_INTEGER Time;
+ULONG CreatorProcessId;
+ULONG CreatorThreadId;
+ULONG ProcessId;
+ULONG ThreadId;
+};
+Here is the data we’ll store as part of the driver (in KDetector.h):
+struct RemoteThreadItem {
+LIST_ENTRY Link;
+RemoteThread Remote;
+};
+const ULONG MaxProcesses = 32;
+ULONG NewProcesses[MaxProcesses];
+ULONG NewProcessesCount;
+ExecutiveResource ProcessesLock;
+LIST_ENTRY RemoteThreadsHead;
+FastMutex RemoteThreadsLock;
+LookasideList<RemoteThreadItem> Lookaside;
+There are a few class wrappers for kernel APIs we haven’t seen yet. FastMutex is the same we used in
+the SysMon driver. ExecutiveResource is a wrapper for an ERESOURCE structure and APIs we looked
+at in chapter 6. Here is its declaration and definition:
+
+===== [PDF page 304] =====
+Chapter 9: Process and Thread Notifications
+298
+// ExecutiveResource.h
+struct ExecutiveResource {
+void Init();
+void Delete();
+void Lock();
+void Unlock();
+void LockShared();
+void UnlockShared();
+private:
+ERESOURCE m_res;
+bool m_CritRegion;
+};
+// ExecutiveResource.cpp
+void ExecutiveResource::Init() {
+ExInitializeResourceLite(&m_res);
+}
+void ExecutiveResource::Delete() {
+ExDeleteResourceLite(&m_res);
+}
+void ExecutiveResource::Lock() {
+m_CritRegion = KeAreApcsDisabled();
+if(m_CritRegion)
+ExAcquireResourceExclusiveLite(&m_res, TRUE);
+else
+ExEnterCriticalRegionAndAcquireResourceExclusive(&m_res);
+}
+void ExecutiveResource::Unlock() {
+if (m_CritRegion)
+ExReleaseResourceLite(&m_res);
+else
+ExReleaseResourceAndLeaveCriticalRegion(&m_res);
+}
+void ExecutiveResource::LockShared() {
+
+===== [PDF page 305] =====
+Chapter 9: Process and Thread Notifications
+299
+m_CritRegion = KeAreApcsDisabled();
+if (m_CritRegion)
+ExAcquireResourceSharedLite(&m_res, TRUE);
+else
+ExEnterCriticalRegionAndAcquireResourceShared(&m_res);
+}
+void ExecutiveResource::UnlockShared() {
+Unlock();
+}
+A few things are worth noting:
+• Acquiring an Executive Resource must be done in a critical region (when normal kernel APCs are
+disabled). The call to KeAreApcsDisabled returns true if normal kernel APCs are disabled. In that
+case a simple acquisition will do; otherwise, a critical region must be entered first, so the “shortcuts”
+to enter a critical region and acquire the Executive Resource are used.
+A similar API, KeAreAllApcsDisabled returns true if all APCs are disabled (essentially
+whether the thread is in a guarded region).
+• An Executive Resource is used to protect the NewProcesses array from concurrent write access.
+The idea is that more reads than writes are expected for this data. In any case, I wanted to show a
+possible wrapper for an Executive Resource.
+• The class presents an interface that can work with the Locker<TLock> type we have been using for
+exclusive access. For shared access, the LockShared and UnlockShared methods are provided.
+To use them conveniently, a companion class to Locker<> can be written to acquire the lock in a
+shared manner. Here is its definition (in Locker.h as well):
+template<typename TLock>
+struct SharedLocker {
+SharedLocker(TLock& lock) : m_lock(lock) {
+lock.LockShared();
+}
+~SharedLocker() {
+m_lock.UnlockShared();
+}
+private:
+TLock& m_lock;
+};
+LookasideList<T> is a wrapper for lookaside lists we met in chapter 8. It’s using the new API, as it’s
+easier for selecting the pool type required. Here is its definition (in LookasideList.h):
+
+===== [PDF page 306] =====
+Chapter 9: Process and Thread Notifications
+300
+template<typename T>
+struct LookasideList {
+NTSTATUS Init(POOL_TYPE pool, ULONG tag) {
+return ExInitializeLookasideListEx(&m_lookaside, nullptr, nullptr,
+pool, 0, sizeof(T), tag, 0);
+}
+void Delete() {
+ExDeleteLookasideListEx(&m_lookaside);
+}
+T* Alloc() {
+return (T*)ExAllocateFromLookasideListEx(&m_lookaside);
+}
+void Free(T* p) {
+ExFreeToLookasideListEx(&m_lookaside, p);
+}
+private:
+LOOKASIDE_LIST_EX m_lookaside;
+};
+Going back to the data members for this driver. The purpose of the NewProcesses array is to keep track
+of new processes before their first thread is created. Once the first thread is created, and identified as such,
+the array will drop the process in question, because from that point on, any new thread created in that
+process from another process is a remote thread for sure. We’ll see all that in the callbacks implementations.
+The driver uses a simple array rather than a linked list, because I don’t expect a lot of processes with no
+threads to exist for more than a tiny fraction, so a fixed sized array should be good enough. However, you
+can change that to a linked list to make this bulletproof.
+When a new process is created, it should be added to the NewProcesses array since the process has zero
+threads at that moment:
+void OnProcessNotify(PEPROCESS Process, HANDLE ProcessId,
+PPS_CREATE_NOTIFY_INFO CreateInfo) {
+UNREFERENCED_PARAMETER(Process);
+if (CreateInfo) {
+if (!AddNewProcess(ProcessId)) {
+KdPrint((DRIVER_PREFIX "New process created, no room to store\n"));
+}
+else {
+KdPrint((DRIVER_PREFIX "New process added: %u\n", HandleToULong(Pro\
+
+===== [PDF page 307] =====
+Chapter 9: Process and Thread Notifications
+301
+cessId)));
+}
+}
+}
+AddProcess locates an empty “slot” in the array and puts the process ID in it:
+bool AddNewProcess(HANDLE pid) {
+Locker locker(ProcessesLock);
+if (NewProcessesCount == MaxProcesses)
+return false;
+for(int i = 0; i < MaxProcesses; i++)
+if (NewProcesses[i] == 0) {
+NewProcesses[i] = HandleToUlong(pid);
+break;
+}
+NewProcessesCount++;
+return true;
+}
+Now comes the interesting part: the thread create/exit callback.
+1. Add process names to the data maintained by the driver for each remote thread. A
+remote thread is when the creator (the caller) is different than the process in which the
+new thread is created. We also have to remove some false positives:
+void OnThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
+if (Create) {
+bool remote = PsGetCurrentProcessId() != ProcessId
+&& PsInitialSystemProcess != PsGetCurrentProcess()
+&& PsGetProcessId(PsInitialSystemProcess) != ProcessId;
+The second and third checks make sure the source process or target process is not the System process. The
+reasons for the System process to exist in these cases are interesting to investigate, but are out of scope for
+this book - we’ll just remove these false positives. The question is how to identify the System process. All
+versions of Windows from XP have the same PID for the System process: 4. We could use that number
+because it’s unlikely to change in the future, but there is another way, which is foolproof and also allows
+me to introduce something new.
+
+===== [PDF page 308] =====
+Chapter 9: Process and Thread Notifications
+302
+The kernel exports a global variable, PsInitialSystemProcess, which always points to the System
+process’ EPROCESS structure. This pointer can be used just like any other opaque process pointer.
+If the thread is indeed remote, we must check if it’s the first thread in the process, and if so, discard this
+as a remote thread:
+if (remote) {
+//
+// really remote if it's not a new process
+//
+bool found = FindProcess(ProcessId);
+FindProcess searches for a process ID in the NewProcesses array:
+bool FindProcess(HANDLE pid) {
+auto id = HandleToUlong(pid);
+SharedLocker locker(ProcessesLock);
+for (int i = 0; i < MaxProcesses; i++)
+if (NewProcesses[i] == id)
+return true;
+return false;
+}
+If the process is found, then it’s the first thread in the process and we should remove the process from the
+new processes array so that subsequent remote threads (if any) can be identified as such:
+if (found) {
+//
+// first thread in process, remove process from new processes array
+//
+RemoveProcess(ProcessId);
+}
+RemoveProcess searches for the PID and removes it from the array by zeroing it out:
+
+===== [PDF page 309] =====
+Chapter 9: Process and Thread Notifications
+303
+bool RemoveProcess(HANDLE pid) {
+auto id = HandleToUlong(pid);
+Locker locker(ProcessesLock);
+for (int i = 0; i < MaxProcesses; i++)
+if (NewProcesses[i] == id) {
+NewProcesses[i] = 0;
+NewProcessesCount--;
+return true;
+}
+return false;
+}
+If the process isn’t found, then it’s not new and we have a real remote thread on our hands:
+else {
+//
+// really a remote thread
+//
+auto item = Lookaside.Alloc();
+auto& data = item->Remote;
+KeQuerySystemTimePrecise(&data.Time);
+data.CreatorProcessId = HandleToULong(PsGetCurrentProcessId());
+data.CreatorThreadId = HandleToULong(PsGetCurrentThreadId());
+data.ProcessId = HandleToULong(ProcessId);
+data.ThreadId = HandleToULong(ThreadId);
+KdPrint((DRIVER_PREFIX
+"Remote thread detected. (PID: %u, TID: %u) -> (PID: %u, TID: %u)\n",
+data.CreatorProcessId, data.CreatorThreadId,
+data.ProcessId, data.ThreadId));
+Locker locker(RemoteThreadsLock);
+// TODO: check the list is not too big
+InsertTailList(&RemoteThreadsHead, &item->Link);
+}
+Getting the data to a user mode client can be done in the same way as we did for the SysMon driver:
+
+===== [PDF page 310] =====
+Chapter 9: Process and Thread Notifications
+304
+NTSTATUS DetectorRead(PDEVICE_OBJECT, PIRP Irp) {
+auto irpSp = IoGetCurrentIrpStackLocation(Irp);
+auto len = irpSp->Parameters.Read.Length;
+auto status = STATUS_SUCCESS;
+ULONG bytes = 0;
+NT_ASSERT(Irp->MdlAddress);
+auto buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(
+Irp->MdlAddress, NormalPagePriority);
+if (!buffer) {
+status = STATUS_INSUFFICIENT_RESOURCES;
+}
+else {
+Locker locker(RemoteThreadsLock);
+while (true) {
+//
+// if the list is empty, there is nothing else to give
+//
+if (IsListEmpty(&RemoteThreadsHead))
+break;
+//
+// if remaining buffer size is too small, break
+//
+if (len < sizeof(RemoteThread))
+break;
+auto entry = RemoveHeadList(&RemoteThreadsHead);
+auto info = CONTAINING_RECORD(entry, RemoteThreadItem, Link);
+ULONG size = sizeof(RemoteThread);
+memcpy(buffer, &info->Remote, size);
+len -= size;
+buffer += size;
+bytes += size;
+//
+// return data item to the lookaside list
+//
+Lookaside.Free(info);
+}
+}
+return CompleteRequest(Irp, status, bytes);
+}
+
+===== [PDF page 311] =====
+Chapter 9: Process and Thread Notifications
+305
+Because there is just one type of “event” and it has a fixed size, the code is simpler than in the SysMon
+case.
+The full driver code is in the KDetector project in the solution for this chapter.
+The Detector Client
+The client code is very similar to the SysMon client, but simpler, because all “events” have the same
+structure and are even fixed-sized. Here are the main and DisplayData functions:
+void DisplayData(const RemoteThread* data, int count) {
+for (int i = 0; i < count; i++) {
+auto& rt = data[i];
+DisplayTime(rt.Time);
+printf("Remote Thread from PID: %u TID: %u -> PID: %u TID: %u\n",
+rt.CreatorProcessId, rt.CreatorThreadId, rt.ProcessId, rt.ThreadId);
+}
+}
+int main() {
+HANDLE hDevice = CreateFile(L"\\\\.\\kdetector", GENERIC_READ, 0,
+nullptr, OPEN_EXISTING, 0, nullptr);
+if (hDevice == INVALID_HANDLE_VALUE)
+return Error("Error opening device");
+RemoteThread rt[20];
+// fixed array is good enough
+for (;;) {
+DWORD bytes;
+if (!ReadFile(hDevice, rt, sizeof(rt), &bytes, nullptr))
+return Error("Failed to read data");
+DisplayData(rt, bytes / sizeof(RemoteThread));
+Sleep(1000);
+}
+CloseHandle(hDevice);
+return 0;
+}
+The DisplayTime is the same one from the SysMonClient project.
+We can test the driver by installing it and starting it normally, and launching our client (or we can use
+DbgView to see the remote thread outputs). The classic example of a remote thread (as mentioned earlier)
+is when a debugger wishes to forcefully break into a target process. Here is one way to do that:
+
+===== [PDF page 312] =====
+Chapter 9: Process and Thread Notifications
+306
+1. Run some executable, say Notepad.exe.
+2. Launch WinDbg.
+3. Use WinDbg to attach to the Notepad process. A remote thread notification should appear.
+Here are some examples of output when the detector client is running:
+13:08:15.280: Remote Thread from PID: 7392 TID: 4788 -> PID: 8336 TID: 9384
+13:08:58.660: Remote Thread from PID: 7392 TID: 13092 -> PID: 8336 TID: 13288
+13:10:52.313: Remote Thread from PID: 7392 TID: 13092 -> PID: 8336 TID: 12676
+13:11:25.207: Remote Thread from PID: 15268 TID: 7564 -> PID: 1844 TID: 6688
+13:11:25.209: Remote Thread from PID: 15268 TID: 15152 -> PID: 1844 TID: 7928
+You might find some remote thread entries surprising (run Process Explorer for a while, for example)
+The full code of the client is in the Detector project.
+Display process names in the client.
+Summary
+In this chapter we looked at some of the callback mechanisms provided by the kernel: process, thread
+and image loads. In the next chapter, we’ll continue with more callback mechanisms - opening handles to
+certain object types, and Registry notifications.

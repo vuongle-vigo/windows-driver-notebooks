@@ -1,0 +1,1146 @@
+CHAPTER 7: The I/O Request Packet (PDF pages 190-229)
+
+===== [PDF page 190] =====
+Chapter 7: The I/O Request Packet
+After a typical driver completes its initialization in DriverEntry, its primary job is to handle requests.
+These requests are packaged as the semi-documented I/O Request Packet (IRP) structure. In this chapter,
+we’ll take a deeper look at IRPs and how a driver handles common IRP types.
+In This chapter:
+• Introduction to IRPs
+• Device Nodes
+• IRP and I/O Stack Location
+• Dispatch Routines
+• Accessing User Buffers
+• Putting it All Together: The Zero Driver
+Introduction to IRPs
+An IRP is a structure that is allocated from non-paged pool typically by one of the “managers” in the
+Executive (I/O Manager, Plug & Play Manager, Power Manager), but can also be allocated by the driver,
+perhaps for passing a request to another driver. Whichever entity allocating the IRP is also responsible for
+freeing it.
+An IRP is never allocated alone. It’s always accompanied by one or more I/O Stack Location structures
+(IO_STACK_LOCATION). In fact, when an IRP is allocated, the caller must specify how many I/O stack
+locations need to be allocated with the IRP. These I/O stack locations follow the IRP directly in memory.
+The number of I/O stack locations is the number of device objects in the device stack. We’ll discuss
+device stacks in the next section. When a driver receives an IRP, it gets a pointer to the IRP structure
+itself, knowing it’s followed by a set of I/O stack location, one of which is for the driver’s use. To get the
+correct I/O stack location, a driver calls IoGetCurrentIrpStackLocation (actually a macro). Figure
+7-1 shows a conceptual view of an IRP and its associated I/O stack locations.
+
+===== [PDF page 191] =====
+Chapter 7: The I/O Request Packet
+185
+Figure 7-1: IRP and its I/O stack locations
+The parameters of the request are somehow “split” between the main IRP structure and the current IO_-
+STACK_LCATION.
+Device Nodes
+The I/O system in Windows is device-centric, rather than driver-centric. This has several implications:
+• Device objects can be named, and handles to device objects can be opened. The CreateFile
+function accepts a symbolic link that leads to a device object. CreateFile cannot accept a driver’s
+name as an argument.
+• Windows supports device layering - one device can be layered on top of another. Any request
+destined for a lower device will reach the uppermost device first. This layering is common for
+hardware-based devices, but it works with any device type.
+Figure 7-2 shows an example of several layers of devices, “stacked” one on top of the other. This set of
+devices is known as a device stack, sometimes referred to as device node (although the term device node is
+often used with hardware device stacks). Figure 7-1 shows six layers, or six devices. Each of these devices is
+represented by a DEVICE_OBJECT structure created by calling the standard IoCreateDevice function.
+
+===== [PDF page 192] =====
+Chapter 7: The I/O Request Packet
+186
+Figure 7-2: Layered devices
+The different device objects that comprise the device node (devnode) layers are labeled according to their
+role in the devnode. These roles are relevant in a hardware-based devnode.
+All the device objects in figure 7-2 are just DEVICE_OBJECT structures, each created by a different driver
+that is in charge of that layer. More generically, this kind of device node does not have to be related to
+hardware-based device drivers.
+Here is a quick rundown of the meaning of the labels present in figure 7-2:
+• PDO (Physical Device Object) - Despite the name, there is nothing “physical” about it. This device
+object is created by a bus driver - the driver that is in charge of the particular bus (e.g. PCI, USB,
+etc.). This device object represents the fact that there is some device in that slot on that bus.
+• FDO (Functional Device Object) - This device object is created by the “real” driver; that is, the driver
+typically provided by the hardware’s vendor that understands the details of the device intimately.
+• FiDO (Filter Device Object) - These are optional filter devices created by filter drivers.
+The Plug & Play (P&P) manager, in this case, is responsible for loading the appropriate drivers, starting
+from the bottom. As an example, suppose the devnode in figure 7-2 represents a set of drivers that manage
+
+===== [PDF page 193] =====
+Chapter 7: The I/O Request Packet
+187
+a PCI network card. The sequence of events leading to the creation of this devnode can be summarized as
+follows:
+1. The PCI bus driver (pci.sys) recognizes the fact that there is something in that particular slot. It
+creates a PDO (IoCreateDevice) to represent this fact. The bus driver has no idea whether this a
+network card, video card or something else; it only knows there is something there and can extract
+basic information from its controller, such as the Vendor ID and Device ID of the device.
+2. The PCI bus driver notifies the P&P manager that it has changes on its bus.
+3. The P&P manager requests a list of PDOs managed by the bus driver. It receives back a list of PDOs,
+in which this new PDO is included.
+4. Now the P&P manager’s job is to find and load the proper driver that new PDO. It issues a query to
+the bus driver to request the full hardware device ID.
+5. With this hardware ID in hand, the P&P manager looks in the Registry at HKLM\System\ Current-
+ControlSet\Enum\PCI\(HardwareID). If the driver has been loaded before, it will be registered there,
+and the P&P manager will load it. Figure 7-3 shows an example hardware ID in the registry (NVIDIA
+display driver).
+6. The driver loads and creates the FDO (another call to IoCreateDevice), but adds an additional
+call to IoAttachDeviceToDeviceStack, thus attaching itself over the previous layer (typically
+the PDO).
+We’ll see how to write filter drivers that take advantage of IoAttachDeviceToDeviceStack in
+chapter 13.
+
+===== [PDF page 194] =====
+Chapter 7: The I/O Request Packet
+188
+Figure 7-3: Hardware ID information
+The value Service in figure 7-3 indirectly points to the actual driver at HKLMSystemCutrrent-
+ControlSetServices{ServiceName} where all drivers must be registered.
+The filter device objects are loaded as well, if they are registered correctly in the Registry. Lower filters
+(below the FDO) load in order, from the bottom. Each filter driver loaded creates its own device object and
+attached it on top of the previous layer. Upper filters work the same way but are loaded after the FDO. All
+this means that with operational P&P devnodes, there are at least two layers - PDO and FDO, but there
+could be more if filters are involved. We’ll look at basic filter development for hardware-based drivers in
+chapter 13.
+Full discussion of Plug & Play and the exact way this kind of devnode is built is beyond the scope of this
+book. The previous description is incomplete and glances over some details, but it should give you the
+basic idea. Every devnode is built from the bottom up, regardless of whether it is related to hardware or
+not.
+Lower filters are searched in two locations: the hardware ID key shown in figure 7-3 and in the correspond-
+ing class based on the ClassGuid value listed under HKLM\System\CurrentControlSet\Control\Classes.
+The value name itself is LowerFilters and is a multiple string value holding service names, pointing to
+
+===== [PDF page 195] =====
+Chapter 7: The I/O Request Packet
+189
+the same Services key. Upper filters are searched in a similar manner, but the value name is UpperFilters.
+Figure 7-4 shows the registry settings for the DiskDrive class, which has a lower filter and an upper filter.
+Figure 7-4: The DiskDrive class key
+IRP Flow
+Figure 7-2 shows an example devnode, whether related to hardware or not. An IRP is created by one of
+the managers in the Executive - for most of our drivers that is the I/O Manager.
+The manager creates an IRP with its associated IO_STACK_LOCATIONs - six in the example in figure 7-2.
+The manager initializes the main IRP structure and the first I/O stack location only. Then it passes the
+IRP’s pointer to the uppermost layer.
+A driver receives the IRP in its appropriate dispatch routine. For example, if this is a Read IRP, then the
+driver will be called in its IRP_MJ_READ index of its MajorFunction array from its driver object. At
+this point, a driver has several options when dealing with IRP:
+• Pass the request down - if the driver’s device is not the last device in the devnode, the driver can
+pass the request along if it’s not interesting for the driver. This is typically done by a filter driver
+that receives a request that it’s not interested in, and in order not to hurt the functionality of the
+device (since the request is actually destined for a lower-layer device), the driver can pass it down.
+This must be done with two calls:
+– Call IoSkipCurrentIrpStackLocation to make sure the next device in line is going to
+see the same information given to this device - it should see the same I/O stack location.
+– Call IoCallDriver passing the lower device object (which the driver received at the time it
+called IoAttachDeviceToDeviceStack) and the IRP.
+Before passing the request down, the driver must prepare the next I/O stack location with proper
+information. Since the I/O manager only initializes the first I/O stack location, it’s the responsibility of
+each driver to initialize the next one. One way to do that is to call IoCopyIrpStackLocationToNext
+before calling IoCallDriver. This works, but is a bit wasteful if the driver just wants the lower
+
+===== [PDF page 196] =====
+Chapter 7: The I/O Request Packet
+190
+layer to see the same information. Calling IoSkipCurrentIrpStackLocation is an optimization
+which decrements the current I/O stack location pointer inside the IRP, which is later incremented
+by IoCallDriver, so the next layer sees the same IO_STACK_LOCATION this driver has seen. This
+decrement/increment dance is more efficient than making an actual copy.
+• Handle the IRP fully - the driver receiving the IRP can just handle the IRP without propagating it
+down by eventually calling IoCompleteRequest. Any lower devices will never see the request.
+• Do a combination of the above options - the driver can examine the IRP, do something (such as log
+the request), and then pass it down. Or it can make some changes to the next I/O stack location, and
+then pass the request down.
+• Pass the request down (with or without changes) and be notified when the request completes by
+a lower layer device - Any layer (except the lowest one) can set up an I/O completion routine
+by calling IoSetCompletionRoutine before passing the request down. When one of the lower
+layers completes the request, the driver’s completion routine will be called.
+• Start some asynchronous IRP handling - the driver may want to handle the request, but if the request
+is lengthy (typical of a hardware driver, but also could be the case for a software driver), the driver
+may mark the IRP as pending by calling IoMarkIrpPending and return a STATUS_PENDING
+from its dispatch routine. Eventually, it will have to complete the IRP.
+Once some layer calls IoCompleteRequest, the IRP turns around and starts “bubbling up” towards
+the originator of the IRP (typically one of the I/O System Managers). If completion routines have been
+registered, they will be invoked in reverse order of registration.
+In most drivers in this book, layering will not be considered, since the driver is most likely the single
+device in its devnode. The driver will handle the request then and there or handle it asynchronously; it
+will not pass it down, as there is no device underneath.
+We’ll discuss other aspects of IRP handling in filter drivers, including completion routines, in chapter 13.
+IRP and I/O Stack Location
+Figure 7-5 shows some of the important fields in an IRP.
+
+===== [PDF page 197] =====
+Chapter 7: The I/O Request Packet
+191
+Figure 7-5: Important fields of the IRP structure
+Here is a quick rundown of these fields:
+• IoStatus - contains the Status (NT_STATUS) of the IRP and an Information field. The
+Information field is a polymorphic one, typed as ULONG_PTR (32 or 64-bit integer), but its
+meaning depends on the type of IRP. For example, for Read and Write IRPs, its meaning is the
+number of bytes transferred in the operation.
+• UserBuffer - contains the raw buffer pointer to the user’s buffer for relevant IRPs. Read and
+Write IRPs, for instance, store the user’s buffer pointer in this field. In DeviceIoControl IRPs,
+this points to the output buffer provided in the request.
+• UserEvent - this is a pointer to an event object (KEVENT) that was provided by a client if the
+call is asynchronous and such an event was supplied. From user mode, this event can be provided
+(with a HANDLE) in the OVERLAPPED structure that is mandatory for invoking I/O operations
+asynchronously.
+• AssociatedIrp - this union holds three members, only one (at most) of which is valid:
+* SystemBuffer - the most often used member. This points to a system-allocated non-paged pool buffer
+used for Buffered I/O operations. See the section “Buffered I/O” later in this chapter for the details.
+* MasterIrp - A pointer to a “master” IRP, if this IRP is an associated IRP. This idea is supported by the
+I/O manager, where one IRP is a “master” that may have several “associated” IRPs. Once all the associated
+
+===== [PDF page 198] =====
+Chapter 7: The I/O Request Packet
+192
+IRPs complete, the master IRP is completed automatically. MasterIrp is valid for an associated IRP - it
+points to the master IRP.
+* IrpCount - for the master IRP itself, this field indicates the number of associated IRPs associated with
+this master IRP.
+Usage of master and associated IRPs is pretty rare. We will not be using this mechanism in this book.
+• Cancel Routine - a pointer to a cancel routine that is invoked (if not NULL) if the driver is asked
+to can cel the IRP, such as with the user mode functions CancelIo and CancelIoEx. Software
+drivers rarely need cancellation routines, so we will not be using those in most examples.
+• MdlAddress - points to an optional Memory Descriptor List (MDL). An MDL is a kernel data
+structure that knows how to describe a buffer in RAM. MdlAddress is used primarily with Direct
+I/O (see the section “Direct I/O” later in this chapter).
+Every IRP is accompanied by one or more IO_STACK_LOCATIONs. Figure 7-6 shows the important fields
+in an IO_STACK_LOCATION.
+Figure 7-6: Important fields of the IO_STACK_LOCATION structure
+
+===== [PDF page 199] =====
+Chapter 7: The I/O Request Packet
+193
+Here’s a rundown of the fields shown in figure 7-6:
+• MajorFunction - this is the major function of the IRP (IRP_MJ_CREATE, IRP_MJ_READ, etc.).
+This field is sometimes useful if the driver points more than one major function code to the same
+handling routine. In that routine, the driver may want to distinguish between the major function
+codes using this field.
+• MinorFunction - some IRP types have minor functions. These are IRP_MJ_PNP, IRP_MJ_POWER
+and IRP_MJ_SYSTEM_CONTROL (WMI). Typical code for these handlers has a switch statement
+based on the MinorFunction. We will not be using these types of IRPs in this book, except in the
+case of filter drivers for hardware-based devices, which we’ll examine in some detail in chapter 13.
+• FileObject - the FILE_OBJECT associated with this IRP. Not needed in most cases, but is
+available for dispatch routines that need it.
+• DeviceObject - the device object associated with this IRP. Dispatch routines receive a pointer to
+this, so typically accessing this field is not required.
+• CompletionRoutine - the completion routine that is set for the previous (upper) layer (set with
+IoSetCompletionRoutine), if any.
+• Context - the argument to pass to the completion routine (if any).
+• Parameters - this monster union contains multiple structures, each valid for a particular operation.
+For example, in a Read (IRP_MJ_READ) operation, the Parameters.Read structure field should
+be used to get more information about the Read operation.
+The current I/O stack location obtained with IoGetCurrentIrpStackLocation hosts most of the
+parameters of the request in the Parameters union. It’s up to the driver to access the correct structure,
+as we’ve already seen in chapter 4 and will see again in this and subsequent chapters.
+Viewing IRP Information
+While debugging or analyzing kernel dumps, a couple of commands may be useful for searching or
+examining IRPs.
+The !irpfind command can be used to find IRPs - either all IRPs, or IRPs that meet certain criteria. Using
+!irpfind without any arguments searches the non-paged pool(s) for all IRPs. Check out the debugger
+documentation on how to specify specific criteria to limit the search. Here’s an example of some output
+when searching for all IRPs:
+lkd> !irpfind
+Unable to get offset of nt!_MI_VISIBLE_STATE.SpecialPool
+Unable to get value of nt!_MI_VISIBLE_STATE.SessionSpecialPool
+Scanning large pool allocation table for tag 0x3f707249 (Irp?) (ffffbf0a8761000\
+0 : ffffbf0a87910000)
+Irp
+[ Thread ]
+irpStack: (Mj,Mn)
+DevObj
+[Driver\
+]
+MDL Process
+ffffbf0aa795ca30 [ffffbf0a7fcde080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+
+===== [PDF page 200] =====
+Chapter 7: The I/O Request Packet
+194
+System\Ntfs]
+ffffbf0a9a8ef010 [ffffbf0a7fcde080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+System\Ntfs]
+ffffbf0a8e68ea20 [ffffbf0a7fcde080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+System\Ntfs]
+ffffbf0a90deb710 [ffffbf0a808a1080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+System\Ntfs]
+ffffbf0a99d1da90 [0000000000000000] Irp is complete (CurrentLocation 10 > Stack\
+Count 9)
+ffffbf0a74cec940 [0000000000000000] Irp is complete (CurrentLocation 8 > StackC\
+ount 7)
+ffffbf0aa0640a20 [ffffbf0a7fcde080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+System\Ntfs]
+ffffbf0a89acf4e0 [ffffbf0a7fcde080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+System\Ntfs]
+ffffbf0a89acfa50 [ffffbf0a7fcde080] irpStack: ( c, 2)
+ffffbf0a74d20050 [ \File\
+System\Ntfs]
+(truncated)
+Faced with a specific IRP, the command !irp examines the IRP, providing a nice overview of its data. As
+always, the dt command can be used with the nt!_IRP type to look at the entire IRP structure. Here’s
+an example of one IRP viewed with !irp:
+kd> !irp ffffbf0a8bbada20
+Irp is active with 13 stacks 12 is current (= 0xffffbf0a8bbade08)
+No Mdl: No System Buffer: Thread ffffbf0a7fcde080:
+Irp stack trace.
+cmd
+flg cl Device
+File
+Completion-Context
+[N/A(0), N/A(0)]
+0
+0 00000000 00000000 00000000-00000000
+Args: 00000000 00000000 00000000 00000000
+[N/A(0), N/A(0)]
+0
+0 00000000 00000000 00000000-00000000
+(truncated)
+Args: 00000000 00000000 00000000 00000000
+[N/A(0), N/A(0)]
+0
+0 00000000 00000000 00000000-00000000
+Args: 00000000 00000000 00000000 00000000
+>[IRP_MJ_DIRECTORY_CONTROL(c), N/A(2)]
+0 e1 ffffbf0a74d20050 ffffbf0a7f52f790 fffff8015c0b50a0-ffffbf0a91d99010 Su\
+
+===== [PDF page 201] =====
+Chapter 7: The I/O Request Packet
+195
+ccess Error Cancel pending
+\FileSystem\Ntfs
+Args: 00004000 00000051 00000000 00000000
+[IRP_MJ_DIRECTORY_CONTROL(c), N/A(2)]
+0
+0 ffffbf0a60e83dc0 ffffbf0a7f52f790 00000000-00000000
+\FileSystem\FltMgr
+Args: 00004000 00000051 00000000 00000000
+The !irp commands lists the I/O stack locations and the information stored in them. The current I/O
+stack location is marked with a > symbol (see the IRP_MJ_DIRECTORY_CONTROL line above).
+The details for each IO_STACK_LOCATION are as follows (in order):
+• first line:
+– Major function code (e.g. IRP_MJ_DEVICE_CONTROL).
+– Minor function code.
+• second line:
+– Flags (mostly unimportant)
+– Control flags
+– Device object pointer
+– File object pointer
+– Completion routine (if any)
+– Completion context (for the completion routine)
+– Success, Error, Cancel indicate the IRP completion cases where the completion routine would
+be invoked
+– “pending” if the IRP was marked as pending (SL_PENDING_RETURNED flag is set in the
+Control flags)
+• Driver name for that layer
+• “Args” line:
+– The value of Parameters.Others.Argument1 in the I/O stack location. Essentially the
+first pointer-size member in the Parameters union.
+– The value of Parameters.Others.Argument2 in the I/O stack location (the second
+pointer-size member in the Parameters union)
+– Device I/O control code (if IRP_MJ_DEVICE_CONTROL or IRP_MJ_INTERNAL_DEVICE_-
+CONTROL). It’s shown as a DML link that invokes the !ioctldecode command to decode the
+control code (more on device I/O control codes later in this chapter). For other major function
+codes, shows the third pointer-size member (Parameters.Others.Argument3)
+– The forth pointer-size member (Parameters.Others.Argument4)
+The !irp command accepts an optional details argument. The default is zero, which provides the output
+described above (considered a summary). Specifying 1 provides additional information in a concrete form.
+Here is an example for an IRP targeted towards the console driver (you can locate those easily by looking
+for cmd.exe processes):
+
+===== [PDF page 202] =====
+Chapter 7: The I/O Request Packet
+196
+lkd> !irp ffffdb899e82a6f0 1
+Irp is active with 2 stacks 1 is current (= 0xffffdb899e82a7c0)
+No Mdl: System buffer=ffffdb89c1c84ac0: Thread ffffdb89b6efa080:
+Irp stack tr\
+ace.
+Flags = 00060030
+ThreadListEntry.Flink = ffffdb89b6efa530
+ThreadListEntry.Blink = ffffdb89b6efa530
+IoStatus.Status = 00000000
+IoStatus.Information = 00000000
+RequestorMode = 00000001
+Cancel = 00
+CancelIrql = 0
+ApcEnvironment = 00
+UserIosb = 73d598f420
+UserEvent = 00000000
+Overlay.AsynchronousParameters.UserApcRoutine = 00000000
+Overlay.AsynchronousParameters.UserApcContext = 00000000
+Overlay.AllocationSize = 00000000 - 00000000
+CancelRoutine = fffff8026f481730
+UserBuffer = 00000000
+&Tail.Overlay.DeviceQueueEntry = ffffdb899e82a768
+Tail.Overlay.Thread = ffffdb89b6efa080
+Tail.Overlay.AuxiliaryBuffer = 00000000
+Tail.Overlay.ListEntry.Flink = ffff8006d16437b8
+Tail.Overlay.ListEntry.Blink = ffff8006d16437b8
+Tail.Overlay.CurrentStackLocation = ffffdb899e82a7c0
+Tail.Overlay.OriginalFileObject = ffffdb89c1c0a240
+Tail.Apc = 8b8b7240
+Tail.CompletionKey = 15f8b8b7240
+cmd
+flg cl Device
+File
+Completion-Context
+>[N/A(f), N/A(7)]
+0
+1 00000000 00000000 00000000-00000000
+pending
+Args: ffff8006d1643790 15f8d92c340 0xa0e666b0 ffffdb899e7a53c0
+[IRP_MJ_DEVICE_CONTROL(e), N/A(0)]
+5
+0 ffffdb89846f9e10 ffffdb89c1c0a240 00000000-00000000
+\Driver\condrv
+Args: 00000000 00000060 0x500016 00000000
+Additionally, specifying detail value of 4 shows Driver Verifier information related to the IRP (if the driver
+handling this IRP is under the verifier’s microscope). Driver Verifier will be discussed in chapter 13.
+
+===== [PDF page 203] =====
+Chapter 7: The I/O Request Packet
+197
+Dispatch Routines
+In chapter 4, we have seen an important aspect of DriverEntry - setting up dispatch routines. These
+are the functions connected with major function codes. The MajorFunction field in DRIVER_OBJECT
+is the array of function pointers index by the major function code.
+All dispatch routines have the same prototype, repeated here for convenience using the DRIVER_DIS-
+PATCH typedef from the WDK (somewhat simplified for clarity):
+typedef NTSTATUS DRIVER_DISPATCH (
+_In_
+PDEVICE_OBJECT DeviceObject,
+_Inout_ PIRP Irp);
+The relevant dispatch routine (based on the major function code) is the first routine in a driver that sees
+the request. Normally, it’s called in the requesting thread context, i.e. the thread that called the relevant
+API (e.g. ReadFile) in IRQL PASSIVE_LEVEL (0). However, it’s possible that a filter driver sitting on
+top of this device sent the request down in a different context - it may be some other thread unrelated
+to the original requestor and even in higher IRQL, such as DISPATCH_LEVEL (2). Robust drivers need to
+be ready to deal with this kind of situation, even though for software drivers this “inconvenient” context
+is rare. We’ll discuss the way to properly deal with this situation in the section “Accessing User Buffers”,
+later in this chapter.
+The first thing a typical dispatch routine does is check for errors. For example, read and write operations
+contain buffers - do these buffers have appropriate size? For DeviceIoControl, there is a control code
+in addition to potentially two buffers. The driver needs to make sure the control code is something it
+recognizes. If any error is identified, the IRP is typically completed immediately with an appropriate status.
+If all checks turn up ok, then the driver can deal with performing the requested operation.
+Here is the list of the most common dispatch routines for a software driver:
+• IRP_MJ_CREATE - corresponds to a CreateFile call from user mode or ZwCreateFile in kernel
+mode. This major function is essentially mandatory, otherwise no client will be able to open a handle
+to a device controlled by this driver. Most drivers just complete the IRP with a success status.
+• IRP_MJ_CLOSE - the opposite of IRP_MJ_CREATE. Called by CloseHandle from user mode or
+ZwClose from kernel mode when the last handle to the file object is about to be closed. Most drivers
+just complete the request successfully, but if something meaningful was done in IRP_MJ_CREATE,
+this is where it should be undone.
+• IRP_MJ_READ - corresponds to a read operation, typically invoked from user mode by ReadFile
+or kernel mode with ZwReadFile.
+• IRP_MJ_WRITE - corresponds to a write operation, typically invoked from user mode by Write-
+File or kernel mode with ZwWriteFile.
+• IRP_MJ_DEVICE_CONTROL - corresponds to the DeviceIoControl call from user mode or
+ZwDeviceIoControlFile from kernel mode (there are other APIs in the kernel that can generate
+IRP_MJ_DEVICE_CONTROL IRPs).
+• IRP_MJ_INTERNAL_DEVICE_CONTROL - similar to IRP_MJ_DEVICE_CONTROL, but only avail-
+able to kernel callers.
+
+===== [PDF page 204] =====
+Chapter 7: The I/O Request Packet
+198
+Completing a Request
+Once a driver decides to handle an IRP (meaning it’s not passing down to another driver), it must eventually
+complete it. Otherwise, we have a leak on our hands - the requesting thread cannot really terminate and
+by extension, its containing process will linger on as well, resulting in a “zombie process”.
+Completing a request means calling IoCompleteRequest after setting the request status and extra
+information. If the completion is done in the dispatch routine itself (a common case for software drivers),
+the routine must return the same status that was placed in the IRP.
+The following code snippet shows how to complete a request in a dispatch routine:
+NTSTATUS MyDispatchRoutine(PDEVICE_OBJECT, PIRP Irp) {
+//...
+Irp->IoStatus.Status = STATUS_XXX;
+Irp->IoStatus.Information = bytes;
+// depends on request type
+IoCompleteRequest(Irp, IO_NO_INCREMENT);
+return STATUS_XXX;
+}
+Since the dispatch routine must return the same status as was placed in the IRP, it’s tempting
+to write the last statement like so: return Irp->IoStatus.Status; This, however, will
+likely result in a system crash. Can you guess why?
+After the IRP is completed, touching any of its members is a bad idea. The IRP has probably
+already been freed and you’re touching deallocated memory. It can actually be worse, since
+another IRP may have been allocated in its place (this is common), and so the code may return
+the status of some random IRP.
+The Information field should be zero in case of an error (a failure status). Its exact meaning for a
+successful operation depends on the type of IRP.
+The IoCompleteRequest API accepts two arguments: the IRP itself and an optional value to temporarily
+boost the original thread’s priority (the thread that initiated the request in the first place). In most cases,
+for software drivers, the thread in question is the executing thread, so a thread boost is inappropriate. The
+value IO_NO_INCREMENT is defined as zero, so no increment in the above code snippet.
+However, the driver may choose to give the thread a boost, regardless of whether it’s the calling thread
+or not. In this case, the thread’s priority jumps with the given boost, and then it’s allowed to execute one
+quantum with that new priority before the priority decreases by one, it can then get another quantum
+with the reduced priority, and so on, until its priority returns to its original level. Figure 7-7 illustrates this
+scenario.
+
+===== [PDF page 205] =====
+Chapter 7: The I/O Request Packet
+199
+Figure 7-7: Thread priority boost and decay
+The thread’s priority after the boost can never go above 15. If it’s supposed to, it will be 15. If
+the original thread’s priority is above 15 already, boosting has no effect.
+Accessing User Buffers
+A given dispatch routine is the first to see the IRP. Some dispatch routines, mainly IRP_MJ_READ, IRP_-
+MJ_WRITE and IRP_MJ_DEVICE_CONTROL accept buffers provided by a client - in most cases from user
+mode. Typically, a dispatch routine is called in IRQL 0 and in the requesting thread context, which means
+the buffers pointers provided by user mode are trivially accessible: the IRQL is 0, so page faults are handled
+normally, and the thread is the requestor, so the pointers are valid in this process context.
+However, there could be issues. As we’ve seen in chapter 6, even in this convenient context (requesting
+thread and IRQL 0), it’s possible for another thread in the client’s process to free the passed-in buffer(s),
+before the driver gets a chance to examine them, and so cause an access violation. The solution we’ve used
+in chapter 6 is to use a __try / __except block to handle any access violation by returning failure to the
+client.
+In some cases, even that is not enough. For example, if we have some code running at IRQL 2 (such as a
+DPC running as a result of timer expiration), we cannot safely access the user’s buffers in this context. In
+general, there are two potential issues here:
+• IRQL of the calling CPU is 2 (or higher), meaning no page fault handling can occur.
+• The thread calling the driver may be some arbitrary thread, and not the original requestor. This
+means that the buffer pointer(s) provided are meaningless, since the wrong process address space is
+accessible.
+
+===== [PDF page 206] =====
+Chapter 7: The I/O Request Packet
+200
+Using exception handling in such a case will not work as expected, because we’ll be accessing some
+memory location that is essentially invalid in this random process context. Even if the access succeeds
+(because that memory happens to be allocated in this random process and is resident in RAM), you’ll be
+accessing random memory, and certainly not the original buffer provided to the client.
+All this means that there must be some good way to access the original user’s buffer in such an inconvenient
+context. In fact, there are two such ways provided by the I/O manager for this purpose, called Buffered I/O
+and Direct I/O. In the next two sections, we’ll see what each of these schemes mean and how to use them.
+Some data structures are always safe to access, since they are allocated from non-paged
+pool (and are in system space). Common examples are device objects (created with
+IoCreateDevice) and IRPs.
+Buffered I/O
+Buffered I/O is the simplest of the two ways. To get support for Buffered I/O for Read and Write operations,
+a flag must be set on the device object like so:
+DeviceObject->Flags |= DO_BUFFERED_IO;
+// DO = Device Object
+DeviceObject is the allocated pointer from a previous call to IoCreateDevice (or IoCreateDe-
+viceSecure).
+For IRP_MJ_DEVICE_CONTROL buffers, see the section “User Buffers for IRP_MJ_DEVICE_CONTROL”
+later in this chapter.
+Here are the steps taken by the I/O Manager and the driver when a read or write request arrives:
+1. The I/O Manager allocates a buffer from non-paged pool with the same size as the user’s buffer. It
+stores the pointer to this new buffer in the AssociatedIrp->SystemBuffer member of the IRP.
+(The buffer size can be found in the current I/O stack location’s Parameters.Read.Length or
+Parameters.Write.Length.)
+2. For a write request, the I/O Manager copies the user’s buffer to the system buffer.
+3. Only now the driver’s dispatch routine is called. The driver can use the system buffer pointer directly
+without any checks, because the buffer is in system space (its address is absolute - the same from
+any process context), and in any IRQL, because the buffer is allocated from non-paged pool, so it
+cannot be paged out.
+4. Once the driver completes the IRP (IoCompleteRequest), the I/O manager (for read requests)
+copies the system buffer back to the user’s buffer (the size of the copy is determined by the
+IoStatus.Information field in the IRP set by the driver).
+5. Finally, the I/O Manager frees the system buffer.
+
+===== [PDF page 207] =====
+Chapter 7: The I/O Request Packet
+201
+You may be wondering how does the I/O Manager copy back the system buffer to the original
+user’s buffer from IoCompleteRequest. This function can be called from any thread, in
+IRQL <= 2. The way it’s done is by queuing a special kernel APC to the thread that requested
+the operation. Once this thread is scheduled for execution, the first thing it does is run this APC
+which performs the actual copying. The requesting thread is obviously in the correct process
+context, and the IRQL is 1, so page faults can be handled normally.
+Figures 7-8a to 7-8e illustrate the steps taken with Buffered I/O.
+Figure 7-8a: Buffered I/O: initial state
+
+===== [PDF page 208] =====
+Chapter 7: The I/O Request Packet
+202
+Figure 7-8b: Buffered I/O: system buffer allocated
+Figure 7-8c: Buffered I/O: driver accesses system buffer
+
+===== [PDF page 209] =====
+Chapter 7: The I/O Request Packet
+203
+Figure 7-8d: Buffered I/O: on IRP completion, I/O manager copies buffer back (for read)
+Figure 7-8e: Buffered I/O: final state - I/O manager frees system buffer
+Buffered I/O has the following characteristics:
+
+===== [PDF page 210] =====
+Chapter 7: The I/O Request Packet
+204
+• Easy to use - just specify the flag in the device object, and everything else is taken care of by the
+I/O Manager.
+• It always involves a copy - which means it’s best used for small buffers (typically up to one page).
+Large buffers may be expensive to copy. In this case, the other option, Direct I/O, should be used
+instead.
+Direct I/O
+The purpose of Direct I/O is to allow access to a user’s buffer in any IRQL and any thread but without any
+copying going around.
+For read and write requests, selecting Direct I/O is done with a different flag of the device object:
+DeviceObject->Flags |= DO_DIRECT_IO;
+As with Buffered I/O, this selection only affects read and write requests. For DeviceIoControl see the
+next section.
+Here are the steps involved in handling Direct I/O:
+1. The I/O Manager first makes sure the user’s buffer is valid and then pages it into physical memory
+(if it wasn’t already there).
+2. It then locks the buffer in memory, so it cannot be paged out until further notice. This solves one
+of the issues with buffer access - page faults cannot happen, so accessing the buffer in any IRQL is
+safe.
+3. The I/O Manager builds a Memory Descriptor List (MDL), a data structure that describes a buffer in
+physical memory. The address of this data structure is stored in the MdlAddress field of the IRP.
+4. At this point, the driver gets the call to its dispatch routine. The user’s buffer, although locked in
+RAM, cannot be accessed from an arbitrary thread just yet. When the driver requires access to the
+buffer, it must call a function that maps the same user buffer to a system address, which by definition
+is valid in any process context. So essentially, we get two mappings to the same memory buffer.
+One is from the original address (valid only in the context of the requestor process) and the other
+in system space, which is always valid. The API to call is MmGetSystemAddressForMdlSafe,
+passing the MDL built by the I/O Manager. The return value is the system address.
+5. Once the driver completes the request, the I/O Manager removes the second mapping (to system
+space), frees the MDL, and unlocks the user’s buffer, so it can be paged normally just like any other
+user-mode memory.
+The MDL is in actually a list of MDL structures, each one describing a piece of the buffer that is contigous
+in physical memory. Remember, that a buffer that is contigous in virtual memory is not necessary
+contigous in physical memory (the smallest piece is a page size). In most case, we don’;’t need to care
+about this detail. One case where this matters is in Direct Memory Access (DMA) operations. Fortunately,
+this is in the realm of hardware-based drivers.
+
+===== [PDF page 211] =====
+Chapter 7: The I/O Request Packet
+205
+Figures 7-9a to 7-9f illustrate the steps taken with Direct I/O.
+Figure 7-9a: Direct I/O: initial state
+
+===== [PDF page 212] =====
+Chapter 7: The I/O Request Packet
+206
+Figure 7-9b: Direct I/O: I/O manager faults buffer’s pages to RAM and locks them
+Figure 7-9c: Direct I/O: the MDL describing the buffer is stored in the IRP
+
+===== [PDF page 213] =====
+Chapter 7: The I/O Request Packet
+207
+Figure 7-9d: Direct I/O: the driver double-maps the buffer to a system address
+Figure 7-9e: Direct I/O: the driver accesses the buffer using the system address
+
+===== [PDF page 214] =====
+Chapter 7: The I/O Request Packet
+208
+Figure 7-9f: Direct I/O: when the IRP is completed, the I/O manager frees the mapping, the MDL and unlocks the buffer
+Notice there is no copying at all. The driver just reads/writes to the user’s buffer directly, using the system
+address.
+Locking the user’s buffer is done with the MmProbeAndLockPages API, fully documented
+in the WDK. Unlocking is done with MmUnlockPages, also documented. This means a driver
+can use these routines outside the narrow context of Direct I/O.
+Calling MmGetSystemAddressForMdlSafe can be done multiple times. The MDL stores a
+flag indicating whether the system mapping has already been done. If so, it just returns the
+existing pointer.
+Here is the prototype of MmGetSystemAddressForMdlSafe:
+PVOID MmGetSystemAddressForMdlSafe (
+_Inout_ PMDL Mdl,
+_In_
+ULONG Priority);
+The function is implemented inline within the wdm.h header by calling the more generic MmMapLocked-
+PagesSpecifyCache function:
+
+===== [PDF page 215] =====
+Chapter 7: The I/O Request Packet
+209
+PVOID MmGetSystemAddressForMdlSafe(PMDL Mdl, ULONG Priority) {
+if (Mdl->MdlFlags & (MDL_MAPPED_TO_SYSTEM_VA|MDL_SOURCE_IS_NONPAGED_POOL)) {
+return Mdl->MappedSystemVa;
+} else {
+return MmMapLockedPagesSpecifyCache(Mdl, KernelMode, MmCached,
+NULL, FALSE, Priority);
+}
+}
+MmGetSystemAddressForMdlSafe accepts the MDL and a page priority (MM_PAGE_PRIORITY enu-
+meration). Most drivers specify NormalPagePriority, but there is also LowPagePriority and
+HighPagePriority. This priority gives a hint to the system of the importance of the mapping in low
+memory conditions. Check the WDK documentation for more information.
+If MmGetSystemAddressForMdlSafe fails, it returns NULL. This means the system is out of system
+page tables or very low on system page tables (depends on the priority argument above). This should be a
+rare occurrence, but still can happen in low memory conditions. A driver must check for this; if NULL is
+returned, the driver should complete the IRP with the status STATUS_INSUFFICIENT_RESOURCES.
+There is a similar function, called MmGetSystemAddressForMdl, which if it fails, crashes
+the system. Do not use this function.
+You may be wondering why doesn’t the I/O manager call MmGetSystemAddressForMdlSafe auto-
+matically, which would be simple enough to do. This is an optimization, where the driver may not need
+to call this function at all if there is any error in the request, so that the mapping doesn’t have to occur
+at all.
+Drivers that don’t set either of the flags DO_BUFFERED_IO nor DO_DIRECT_IO in the device object
+flags implicitly use Neither I/O, which simply means the driver doesn’t get any special help from the I/O
+manager, and it’s up to the driver to deal with the user’s buffer.
+User Buffers for IRP_MJ_DEVICE_CONTROL
+The last two sections discussed Buffered I/O and Direct I/O as they pertain to read and write requests. For
+IRP_MJ_DEVICE_CONTROL (and IRP_MJ_INTERNAL_DEVICE_CONTROL), the buffering access method
+is supplied on a control code basis. Here is the prototype of the user-mode API DeviceIoControl (it’s
+similar with the kernel function ZwDeviceIoControlFile):
+
+===== [PDF page 216] =====
+Chapter 7: The I/O Request Packet
+210
+BOOL DeviceIoControl(
+HANDLE hDevice,
+// handle to device or file
+DWORD dwIoControlCode,
+// IOCTL code (see <winioctl.h>)
+PVOID lpInBuffer,
+// input buffer
+DWORD nInBufferSize,
+// size of input buffer
+PVOID lpOutBuffer,
+// output buffer
+DWORD nOutBufferSize,
+// size of output buffer
+PDWORD lpdwBytesReturned,
+// # of bytes actually returned
+LPOVERLAPPED lpOverlapped); // for async. operation
+There are three important parameters here: the I/O control code, and optional two buffers designated
+“input” and “output”. As it turns out, the way these buffers are accessed depends on the control code,
+which is very convenient, because different requests may have different requirements related to accessing
+the user’s buffer(s).
+The control code defined by a driver must be built with the CTL_CODE macro, defined in the WDK and
+user-mode headers, defined like so:
+#define CTL_CODE( DeviceType, Function, Method, Access ) ( \
+((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+The first parameter, DeviceType can be one of a set of constants defined by Microsoft for various known
+device types (such as FILE_DEVICE_DISK and FILE_DEVICE_KEYBOARD). For custom devices (like the
+ones we are writing), it can be any value, but the documnentation states that the minimum value for
+custom codes should be 0x8000.
+The second parameter, Function is a running index, that must be different between multiple control
+codes defined by the same driver. If all other components of the macro are same (possible), at least the
+Function would be a differentating factor. Similarly to device type, the official documentation states that
+custom devices should use values starting from 0x800.
+The third parameter (Method) is the key to selecting the buffering method for accessing the input and
+output buffers provided with DeviceIoControl. Here are the options:
+• METHOD_NEITHER - this value means no help is required of the I/O manager, so the driver is left
+dealing with the buffers on its own. This could be useful, for instance, if the particular code does
+not require any buffer - the control code itself is all the information needed - it’s best to let the I/O
+manager know that it does not need to do any additional work.
+– In this case, the pointer to the user’s input buffer is store in the current I/O stack location’s
+Paramaters.DeviceIoControl.Type3InputBuffer field, and the output buffer is
+stored in the IRP’s UserBuffer field.
+• METHOD_BUFFERED - this value indicates Buffered I/O for both the input and output buffer. When
+the request starts, the I/O manager allocates the system buffer from non-paged pool with the
+size that is the maximum of the lengths of the input and output buffers. It then copies the input
+buffer to the system buffer. Only now the IRP_MJ_DEVICE_CONTROL dispatch routine is invoked.
+When the request completes, the I/O manager copies the number of bytes indicated with the
+IoStatus.Information field in the IRP to the user’s output buffer.
+
+===== [PDF page 217] =====
+Chapter 7: The I/O Request Packet
+211
+– The system buffer pointer is at the usual location: AssociatedIrp.SystemBuffer inside
+the IRP structure.
+• METHOD_IN_DIRECT and METHOD_OUT_DIRECT - contrary to intuition, both of these values mean
+the same thing as far as buffering methods are concerned: the input buffer uses Buffered I/O and the
+output buffer uses Direct I/O. The only difference between these two values is whether the output
+buffer can be read (METHOD_IN_DIRECT) or written (METHOD_OUT_DIRECT).
+The last bullet indicates that the output buffer can also be treated as input by using METHOD_-
+IN_DIRECT.
+Table 7-1 summarizes these buffering methods.
+Table 7-1: Buffering method based on control code Method parameter
+Method
+Input buffer
+Output buffer
+METHOD_NEITHER
+Neither
+Neither
+METHOD_BUFFERED
+Buffered
+Buffered
+METHOD_IN_DIRECT
+Buffered
+Direct
+METHOD_OUT_DIRECT
+Buffered
+Direct
+Finally, the Access parameter to the macro indicates the direction of data flow. FILE_WRITE_ACCESS
+means from the client to the driver, FILE_READ_ACCESS means the opposite, and FILE_ANY_ACCESS
+means bi-directional access (the input and output buffers are used). You shoudl always use FILE_ANY_-
+ACCESS. Beside simplifying the control code building, you guarantee that if later on, once the driver
+is already deployed, you may want to use the other buffer, you wouldn’t need to change the Access
+parameter, and so not disturb existing clients that would not know about the control code change.
+If a control code is built with METHOD_NEITHER, the I/O manager does nothing to help with
+accessing the buffer(s). The values for the input and output buffer pointers provided by the
+client are copied as-is to the IRP. No checking is done by the I/O manager to make sure these
+pointers point to valid memory. A driver should not use these pointers as memory pointers, but
+they can be used as two arbitrary values propagating to the driver that may mean something.
+Putting it All Together: The Zero Driver
+In this section, we’ll use what we’ve learned in this (and earlier) chapter and build a driver and a client
+application. The driver is named Zero and has the following characteristics:
+• For read requests, it zeros out the provided buffer.
+• For write requests, it just consumes the provided buffer, similar to a classic null device.
+
+===== [PDF page 218] =====
+Chapter 7: The I/O Request Packet
+212
+The driver will use Direct I/O so as not to incur the overhead of copies, as the buffers provided by the
+client can potentially be very large.
+We’ll start the project by creating an “Empty WDM Project” in Visual Studio and and name it Zero. Then
+we’ll delete the created INF file, resulting in an empty project, just like in previous examples.
+Using a Precompiled Header
+One technique that we can use that is not specific to driver development, but is generally useful, is using
+a precompiled header. Precompiled headers is a Visual Studio feature that helps with faster compilation
+times. The precompiled header is a header file that has #include statements for headers that rarely
+change, such as ntddk.h for drivers. The precompiled header is compiled once, stored in an internal
+binary format, and used in subsequent compilations, which become considerably faster.
+Many user mode projects created by Visual Studio already use precompiled headers. Kernel-
+mode projects provided by the WDK templates currently don’t use precompiled headers. Since
+we’re starting with an empty project, we have to set up precompiled headers manually anyway.
+Follow these steps to create and use a precompiled header:
+• Add a new header file to the project and call it pch.h. This file will serve as the precompiled header.
+Add all rarely-changing #includes here:
+// pch.h
+#pragma once
+#include <ntddk.h>
+• Add a source file named pch.cpp and put a single #include in it: the precompiled header itself:
+#include "pch.h"
+• Now comes the tricky part. Letting the compiler know that pch.h is the precompiled header and
+pch.cpp is the one creating it. Open project properties, select All Configurations and All Platforms
+so you won’t need to configure every configuraion/platform separately, navigate to C/C++ /
+Precompiled Headers and set Precompiled Header to Use and the file name to “pch.h” (see figure
+7-10). Click OK and to close the dialog box.
+
+===== [PDF page 219] =====
+Chapter 7: The I/O Request Packet
+213
+Figure 7-10: Setting precompiled header for the project
+• The pch.cpp file should be set as the creator of the precompiled header. Right click this file in Solution
+Explorer, and select Properties. Navigate to C/C++ / Precompiled Headers and set Precompiled Header
+to Create (see figure 7-11). Click OK to accept the setting.
+
+===== [PDF page 220] =====
+Chapter 7: The I/O Request Packet
+214
+Figure 7-10: Setting precompiled header for pch.cpp
+From this point on, every C/CPP file in the project must #include "pch.h" as the first thing in the file.
+Without this include, the project will not compile.
+Make sure there is nothing before this #include "pch.h" in a source file. Anything before
+this line does not get compiled at all!
+The DriverEntry Routine
+The DriveEntry routine for the Zero driver is very similar to the one we created for the driver in chapter
+4. However, in chapter 4’s driver the code in DriverEntry had to undo any operation that was already done
+in case of a later error. We had just two operations that could be undone: creation of the device object and
+creation of the symbolic link. The Zero driver is similar, but we’ll create a more robust and less error-prone
+code to handle errors during initialization. Let’s start with the basics of setting up an unload routine and
+the dispatch routines:
+
+===== [PDF page 221] =====
+Chapter 7: The I/O Request Packet
+215
+#define DRIVER_PREFIX "Zero: "
+// DriverEntry
+extern "C" NTSTATUS
+DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+UNREFERENCED_PARAMETER(RegistryPath);
+DriverObject->DriverUnload = ZeroUnload;
+DriverObject->MajorFunction[IRP_MJ_CREATE] =
+DriverObject->MajorFunction[IRP_MJ_CLOSE] = ZeroCreateClose;
+DriverObject->MajorFunction[IRP_MJ_READ] = ZeroRead;
+DriverObject->MajorFunction[IRP_MJ_WRITE] = ZeroWrite;
+Now we need to create the device object and symbolic link and handle errors in a more general and robust
+way. The trick we’ll use is a do / while(false) block, which is not really a loop, but it allows getting
+out of the block with a simple break statement in case something goes wrong:
+UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\Zero");
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\Zero");
+PDEVICE_OBJECT DeviceObject = nullptr;
+auto status = STATUS_SUCCESS;
+do {
+status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN,
+0, FALSE, &DeviceObject);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to create device (0x%08X)\n", status));
+break;
+}
+// set up Direct I/O
+DeviceObject->Flags |= DO_DIRECT_IO;
+status = IoCreateSymbolicLink(&symLink, &devName);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to create symbolic link (0x%08X)\n",
+status));
+break;
+}
+} while (false);
+if (!NT_SUCCESS(status)) {
+
+===== [PDF page 222] =====
+Chapter 7: The I/O Request Packet
+216
+if (DeviceObject)
+IoDeleteDevice(DeviceObject);
+}
+return status;
+The pattern is simple: if an error occurs in any call, just break out of the “loop”. Outside the loop, check
+the status, and if it’s a failure, undo any operations done so far. With this scheme in hand, it’s easy to add
+more initializations (which we’ll need in more complex drivers), while keeping the cleanup code localized
+and appearing just once.
+It’s possible to use goto statements instead of the do / while(false) approach, but as the great
+Dijkstra wrote, “goto considered harmful”, so I tend to avoid it if I can.
+Notice we’re also initializing the device to use Direct I/O for our read and write operations.
+The Create and Close Dispatch Routines
+Before we get to the actual implementation of IRP_MJ_CREATE and IRP_MJ_CLOSE (pointing to the
+same function), let’s create a helper function that simplifies completing an IRP with a given status and
+information:
+NTSTATUS CompleteIrp(PIRP Irp,
+NTSTATUS status = STATUS_SUCCESS,
+ULONG_PTR info = 0) {
+Irp->IoStatus.Status = status;
+Irp->IoStatus.Information = info;
+IoCompleteRequest(Irp, IO_NO_INCREMENT);
+return status;
+}
+Notice the default values for the status and information. The Create/Close dispatch routine implementation
+becomes almost trivial:
+NTSTATUS ZeroCreateClose(PDEVICE_OBJECT, PIRP Irp) {
+return CompleteIrp(Irp);
+}
+The Read Dispatch Routine
+The Read routine is the most interesting. First we need to check the length of the buffer to make sure it’s
+not zero. If it is, just complete the IRP with a failure status:
+
+===== [PDF page 223] =====
+Chapter 7: The I/O Request Packet
+217
+NTSTATUS ZeroRead(PDEVICE_OBJECT, PIRP Irp) {
+auto stack = IoGetCurrentIrpStackLocation(Irp);
+auto len = stack->Parameters.Read.Length;
+if (len == 0)
+return CompleteIrp(Irp, STATUS_INVALID_BUFFER_SIZE);
+Note that the length of the user’s buffer is provided through the Parameters.Read member inside the
+current I/O stack location.
+We have configured Direct I/O, so we need to map the locked buffer to system space using MmGetSys-
+temAddressForMdlSafe:
+NT_ASSERT(Irp->MdlAddress);
+// make sure Direct I/O flag was set
+auto buffer = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+if (!buffer)
+return CompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES);
+The functionality we need to implement is to zero out the given buffer. We can use a simple memset call
+to fill the buffer with zeros and then complete the request:
+memset(buffer, 0, len);
+return CompleteIrp(Irp, STATUS_SUCCESS, len);
+}
+If you prefer a more “fancy” function to zero out memory, call RtlZeroMemory. It’s a macro, defined
+in terms of memset.
+It’s important to set the Information field to the length of the buffer. This indicates to the client the
+number of bytes transferred in the operation (returned in the second to last parameter to ReadFile). This
+is all we need for the read operation.
+The Write Dispatch Routine
+The write dispatch routine is even simpler. All it needs to do is complete the request with the buffer length
+provided by the client (essentially swallowing the buffer):
+
+===== [PDF page 224] =====
+Chapter 7: The I/O Request Packet
+218
+NTSTATUS ZeroWrite(PDEVICE_OBJECT, PIRP Irp) {
+auto stack = IoGetCurrentIrpStackLocation(Irp);
+auto len = stack->Parameters.Write.Length;
+return CompleteIrp(Irp, STATUS_SUCCESS, len);
+}
+Note that we don’t even bother calling MmGetSystemAddressForMdlSafe, as we don’t need to access
+the actual buffer. This is also the reason this call is not made beforehand by the I/O manager: the driver
+may not even need it, or perhaps need it in certain conditions only; so the I/O manager prepares everything
+(the MDL) and lets the driver decide when and if to map the buffer.
+Test Application
+We’ll add a new console application project to the solution to test the read and write operations.
+Here is some simple code to test these operations:
+int Error(const char* msg) {
+printf("%s: error=%u\n", msg, ::GetLastError());
+return 1;
+}
+int main() {
+HANDLE hDevice = CreateFile(L"\\\\.\\Zero", GENERIC_READ | GENERIC_WRITE,
+0, nullptr, OPEN_EXISTING, 0, nullptr);
+if (hDevice == INVALID_HANDLE_VALUE) {
+return Error("Failed to open device");
+}
+// test read
+BYTE buffer[64];
+// store some non-zero data
+for (int i = 0; i < sizeof(buffer); ++i)
+buffer[i] = i + 1;
+DWORD bytes;
+BOOL ok = ReadFile(hDevice, buffer, sizeof(buffer), &bytes, nullptr);
+if (!ok)
+return Error("failed to read");
+if (bytes != sizeof(buffer))
+printf("Wrong number of bytes\n");
+
+===== [PDF page 225] =====
+Chapter 7: The I/O Request Packet
+219
+// check that all bytes are zero
+for (auto n : buffer)
+if (n != 0) {
+printf("Wrong data!\n");
+break;
+}
+// test write
+BYTE buffer2[1024];
+// contains junk
+ok = WriteFile(hDevice, buffer2, sizeof(buffer2), &bytes, nullptr);
+if (!ok)
+return Error("failed to write");
+if (bytes != sizeof(buffer2))
+printf("Wrong byte count\n");
+CloseHandle(hDevice);
+}
+Read/Write Statistics
+Let’s add some more functionality to the Zero driver. We may want to count the total bytes read/written
+throughout the lifetime of the driver. A user-mode client should be able to read these statistics, and perhaps
+even zero them out.
+We’ll start by defining two global variables to keep track of the total number of bytes read/written (in
+Zero.cpp):
+long long g_TotalRead;
+long long g_TotalWritten;
+You could certainly put these in a structure for easier maintenance and extension. The long long C++
+type is a signed 64-bit value. You can add unsigned if you wish, or use a typedef such as LONG64 or
+ULONG64, which would mean the same thing. Since these are global variables, they are zeroed out by
+default.
+We’ll create a new file that contains information common to user-mode clients and the driver called
+ZeroCommon.h. here is where we define the control codes we support, as well as data structures to be
+shared with user-mode.
+First, we’ll add two control codes: one for getting the stats and another for clearing them:
+
+===== [PDF page 226] =====
+Chapter 7: The I/O Request Packet
+220
+#define DEVICE_ZERO 0x8022
+#define IOCTL_ZERO_GET_STATS
+\
+CTL_CODE(DEVICE_ZERO, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_ZERO_CLEAR_STATS \
+CTL_CODE(DEVICE_ZERO, 0x801, METHOD_NEITHER, FILE_ANY_ACCESS)
+The DEVICE_ZERO is defined as some number from 0x8000 as the documentation recommends. The
+function number starts with 0x800 and incremented with each control code. METHOD_BUFFERED is used
+for getting the stats, as the size of the returned data is small (2 x 8 bytes). Clearing the stats requires no
+buffers, so METHOD_NEITHER is selected.
+Next, we’ll add a structure that can be used by clients (and the driver) for storing the stats:
+struct ZeroStats {
+long long TotalRead;
+long long TotalWritten;
+};
+In DriverEntry, we add a dispatch routine for IRP_MJ_DEVICE_CONTROL like so:
+DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ZeroDeviceControl;
+All the work is done in ZeroDeviceControl. First, some initialization:
+NTSTATUS ZeroDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
+auto irpSp = IoGetCurrentIrpStackLocation(Irp);
+auto& dic = irpSp->Parameters.DeviceIoControl;
+auto status = STATUS_INVALID_DEVICE_REQUEST;
+ULONG_PTR len = 0;
+The details for IRP_MJ_DEVICE_CONTROL are located in the current I/O stack location in the Parame-
+ters.DeviceIoControl structure. The status is initialized to an error in case the control code provided
+is unsupported. len keeps track of the number of valid bytes returned in the output buffer.
+Implementing the IOCTL_ZERO_GET_STATS is done in the usual way. First, check for errors. If all goes
+well, the stats are written to the output buffer:
+
+===== [PDF page 227] =====
+Chapter 7: The I/O Request Packet
+221
+switch (dic.IoControlCode) {
+case IOCTL_ZERO_GET_STATS:
+{
+// artificial scope so the compiler doesn not complain
+// about defining variables skipped by a case
+if (dic.OutputBufferLength < sizeof(ZeroStats)) {
+status = STATUS_BUFFER_TOO_SMALL;
+break;
+}
+auto stats = (ZeroStats*)Irp->AssociatedIrp.SystemBuffer;
+if (stats == nullptr) {
+status = STATUS_INVALID_PARAMETER;
+break;
+}
+//
+// fiil in the output buffer
+//
+stats->TotalRead = g_TotalRead;
+stats->TotalWritten = g_TotalWritten;
+len = sizeof(ZeroStats);
+break;
+}
+Once out of the switch, the IRP would be completed. Here is the stats clearing Ioctl handling:
+case IOCTL_ZERO_CLEAR_STATS:
+g_TotalRead = g_TotalWritten = 0;
+break;
+}
+All that’s left to do is complete the IRP with whatever status and length values are:
+return CompleteIrp(Irp, status, len);
+For easier viewing, here is the complete IRP_MJ_DEVICE_CONTROL handling:
+
+===== [PDF page 228] =====
+Chapter 7: The I/O Request Packet
+222
+NTSTATUS ZeroDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
+auto irpSp = IoGetCurrentIrpStackLocation(Irp);
+auto& dic = irpSp->Parameters.DeviceIoControl;
+auto status = STATUS_INVALID_DEVICE_REQUEST;
+ULONG_PTR len = 0;
+switch (dic.IoControlCode) {
+case IOCTL_ZERO_GET_STATS:
+{
+if (dic.OutputBufferLength < sizeof(ZeroStats)) {
+status = STATUS_BUFFER_TOO_SMALL;
+break;
+}
+auto stats = (ZeroStats*)Irp->AssociatedIrp.SystemBuffer;
+if (stats == nullptr) {
+status = STATUS_INVALID_PARAMETER;
+break;
+}
+stats->TotalRead = g_TotalRead;
+stats->TotalWritten = g_TotalWritten;
+len = sizeof(ZeroStats);
+break;
+}
+case IOCTL_ZERO_CLEAR_STATS:
+g_TotalRead = g_TotalWritten = 0;
+break;
+}
+return CompleteIrp(Irp, status, len);
+}
+The stats have to be updated when data is read/written. It must be done in a thread safe way, as multiple
+clients may bombard the driver with read/write requests. Here is the updates ZeroWrite function:
+
+===== [PDF page 229] =====
+Chapter 7: The I/O Request Packet
+223
+NTSTATUS ZeroWrite(PDEVICE_OBJECT, PIRP Irp) {
+auto stack = IoGetCurrentIrpStackLocation(Irp);
+auto len = stack->Parameters.Write.Length;
+// update the number of bytes written
+InterlockedAdd64(&g_TotalWritten, len);
+return CompleteIrp(Irp, STATUS_SUCCESS, len);
+}
+The change to ZeroRead is very similar.
+Astute readers may question the safety of the Ioctl implementations. For example, is reading the total
+number of bytes read/written with no multithreaded protection (while possible read/write operations
+are in effect) a correct operation, or is it a data race? Technically, it’s a data race, as the driver might be
+updating to the stats globals while some client is reading the values, that could result in torn reads. One
+way to resolve that is by dispensing with the interlocked instructions and use a mutex or a fast mutex to
+protect access to these variables. Alternatively, There are functions to deal with these scenario, such as
+ReadAcquire64. Their implementation is CPU dependent. For x86/x64, they are actually normal reads,
+as the processor provides safety against such torn reads. On ARM CPUs, this requires a memory barrier
+to be inserted (memory barriers are beyond the scope of this book).
+Save the number of bytes read/written to the Registry before the driver unloads. Read it back
+when the driver loads.
+Replace the Interlocked instructions with a fast mutex to protect access to the stats.
+Here is some client code to retrieve these stats:
+ZeroStats stats;
+if (!DeviceIoControl(hDevice, IOCTL_ZERO_GET_STATS,
+nullptr, 0, &stats, sizeof(stats), &bytes, nullptr))
+return Error("failed in DeviceIoControl");
+printf("Total Read: %lld, Total Write: %lld\n",
+stats.TotalRead, stats.TotalWritten);
+Summary
+In this chapter, we learned how to handle IRPs, which drivers deal with all the time. Armed with this
+knowledge, we can start leveraging more kernel functionality, starting with process and thread callbacks
+in chapter 9. Before getting to that, however, there are more techniques and kernel APIs that may be useful
+for a driver developer, described in the next chapter.

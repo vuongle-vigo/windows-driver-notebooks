@@ -1,0 +1,931 @@
+CHAPTER 3: Kernel Programming Basics (PDF pages 39-61)
+
+===== [PDF page 39] =====
+Chapter 3: Kernel Programming Basics
+In this chapter, we’ll dig deeper into kernel APIs, structures, and definitions. We’ll also examine some of
+the mechanisms that invoke code in a driver. Finally, we’ll put all that knowledge together to create our
+first functional driver and client application.
+In this chapter:
+• General Kernel Programming Guidelines
+• Debug vs. Release Builds
+• The Kernel API
+• Functions and Error Codes
+• Strings
+• Dynamic Memory Allocation
+• Linked Lists
+• Object Attributes
+• The Driver Object
+• Device Objects
+General Kernel Programming Guidelines
+Developing kernel drivers requires the Windows Driver Kit (WDK), where the appropriate headers and
+libraries needed are located. The kernel APIs consist of C functions, very similar in essence to user-mode
+APIs. There are several differences, however. Table 3-1 summarizes the important differences between
+user-mode programming and kernel-mode programming.
+Table 3-1: Differences between user mode and kernel mode development
+User Mode
+Kernel Mode
+Unhandled Exceptions
+Unhandled exceptions crash the process
+Unhandled exceptions crashes the system
+Termination
+When a process terminates, all private
+memory and resources are freed
+automatically
+If a driver unloads without freeing
+everything it was using, there is a leak,
+only resolved in the next boot
+Return values
+API errors are sometimes ignored
+Should (almost) never ignore errors
+IRQL
+Always PASSIVE_LEVEL (0)
+May be DISPATCH_LEVEL (2) or higher
+
+===== [PDF page 40] =====
+Chapter 3: Kernel Programming Basics
+34
+Table 3-1: Differences between user mode and kernel mode development
+User Mode
+Kernel Mode
+Bad coding
+Typically localized to the process
+Can have system-wide effects
+Testing and Debugging
+Typical testing and debugging done on
+the developer’s machine
+Debugging must be done with another
+machine
+Libraries
+Can use almost and C/C++ library (e.g.
+STL, boost)
+Most standard libraries cannot be used
+Exception Handling
+Can use C++ exceptions or Structured
+Exception Handling (SEH)
+Only SEH can be used
+C++ Usage
+Full C++ runtime available
+No C++ runtime
+Unhandled Exceptions
+Exceptions occurring in user-mode that are not caught by the program cause the process to terminate
+prematurely. Kernel-mode code, on the other hand, being implicitly trusted, cannot recover from an
+unhandled exception. Such an exception causes the system to crash with the infamous Blue screen of
+death (BSOD) (newer versions of Windows have more diverse colors for the crash screen). The BSOD may
+first appear to be a form of punishment, but it’s essentially a protection mechanism. The rationale being
+it, is that allowing the code to continue execution could cause irreversible damage to Windows (such as
+deleting important files or corrupting the registry) that may cause the system to fail boot. It’s better, then,
+to stop everything immediately to prevent potential damage. We’ll discuss the BSOD in more detail in
+chapter 6.
+All this leads to at least one conclusion: kernel code must be carefully programmed, meticulous, and not
+skip any details, or error checks.
+Termination
+When a process terminates, for whatever reason - either normally, because of an unhandled exception,
+or terminated by external code - it never leaks anything: all private memory is freed, and all handles are
+closed. Of course, premature handle closing may cause some loss of data, such as a file handle being closed
+before flushing some data to disk - but there are no resource leaks beyond the lifetime of the process; this
+is guaranteed by the kernel.
+Kernel drivers, on the other hand, don’t provide such a guarantee. If a driver unloads while still holding
+onto allocated memory or open kernel handles - these resources will not be freed automatically, only
+released at the next system boot.
+Why is that? Can’t the kernel keep track of a driver’s allocations and resource usage so these can be freed
+automatically when the driver unloads?
+Theoretically, this would have been possible to achieve (although currently the kernel does not track such
+resource usage). The real issue is that it would be too dangerous for the kernel to attempt such cleanup.
+The kernel has no way of knowing whether the driver leaked those resources for a reason; for example, the
+driver could allocate some buffer and then pass it to another driver, with which it cooperates. That second
+driver may use the memory buffer and free it eventually. If the kernel attempted to free the buffer when
+
+===== [PDF page 41] =====
+Chapter 3: Kernel Programming Basics
+35
+the first driver unloads, the second driver would cause an access violation when accessing that now-freed
+buffer, causing a system crash.
+This emphasizes the responsibility of a kernel driver to properly clean up after itself; no one else will do it.
+Function Return Values
+In typical user-mode code, return values from API functions are sometimes ignored, the developer being
+somewhat optimistic that the called function is unlikely to fail. This may or may not be appropriate for
+one function or another, but in the worst case, an unhandled exception would later crash the process; the
+system, however, remains intact.
+Ignoring return values from kernel APIs is much more dangerous (see the previous Termination section),
+and generally should be avoided. Even seemingly “innocent” looking functions can fail for unexpected
+reasons, so the golden rule here is - always check return status values from kernel APIs.
+IRQL
+Interrupt Request Level (IRQL) is an important kernel concept that will be further discussed in chapter 6.
+Suffice it to say at this point that normally a processor’s IRQL is zero, and in particular it’s always zero
+when user-mode code is executing. In kernel mode, it’s still zero most of the time - but not all the time.
+Some restrictions on code execution exist at IRQL 2 and higher, which means the driver writer must be
+careful to use only allowed APIs at that high IRQL. The effects of higher than zero IRQLs are discussed in
+chapter 6.
+C++ Usage
+In user mode programming, C++ has been used for many years, and it works well when combined with
+user-mode Windows APIs. With kernel code, Microsoft started officially supporting C++ with Visual
+Studio 2012 and WDK 8. C++ is not mandatory, of course, but it has some important benefits related
+to resource cleanup, with a C++ idiom called Resource Acquisition Is Initialization (RAII). We’ll use this
+RAII idiom quite a bit to make sure we don’t leak resources.
+C++ as a language is almost fully supported for kernel code. But there is no C++ runtime in the kernel,
+and so some C++ features just cannot be used:
+• The new and delete operators are not supported and will fail to compile. This is because their
+normal operation is to allocate from a user-mode heap, which is irrelevant within the kernel. The
+kernel API has “replacement” functions that are more closely modeled after the C functions malloc
+and free. We’ll discuss these functions later in this chapter. It is possible, however, to overload the
+new and delete operators similarly as is sometimes done in user-mode, and invoke the kernel
+allocation and free functions in the implementation. We’ll see how to do that later in this chapter
+as well.
+• Global variables that have non-default constructors will not be called - there is no C/C++ runtime
+to call these constructors. These situations must be avoided, but there are some workarounds:
+– Avoid any code in the constructor and instead create some Init function to be called explicitly
+from driver code (e.g. from DriverEntry).
+
+===== [PDF page 42] =====
+Chapter 3: Kernel Programming Basics
+36
+– Allocate a pointer only as a global (or static) variable, and create the actual instance
+dynamically. The compiler will generate the correct code to invoke the constructor. This works
+assuming the new and delete operators have been overloaded, as described later in this
+chapter.
+• The C++ exception handling keywords (try, catch, throw) do not compile. This is because
+the C++ exception handling mechanism requires its own runtime, which is not present in the
+kernel. Exception handling can only be done using Structured Exception Handling (SEH) - a kernel
+mechanism to handle exceptions. We’ll take a detailed look at SEH in chapter 6.
+• The standard C++ libraries are not available in the kernel. Although most are template-based, these
+do not compile, because they may depend on user-mode libraries and semantics. That said, C++
+templates as a language feature work just fine. One good usage of templates is to create alternatives
+for a kernel-mode library types, based on similar types from the user-mode standard C++ library,
+such as std::vector<>, std::wstring, etc.
+The code examples in this book make some use of C++. The features mostly used in the code examples
+are:
+• The nullptr keyword, representing a true NULL pointer.
+• The auto keyword that allows type inference when declaring and initializing variables. This is
+useful to reduce clutter, save some typing, and focus on the important pieces.
+• Templates will be used where they make sense.
+• Overloading of the new and delete operators.
+• Constructors and destructors, especially for building RAII types.
+Any C++ standard can be used for kernel development. The Visual Studio setting for new projects is to
+use C++ 14. However, you can change the C++ compiler standard to any other setting, including C++ 20
+(the latest standard as of this writing). Some features we’ll use later will depend on C++ 17 at least.
+Strictly speaking, kernel drivers can be written in pure C without any issues. If you prefer to go that route,
+use files with a C extension rather than CPP. This will automatically invoke the C compiler for these files.
+Testing and Debugging
+With user-mode code, testing is generally done on the developer’s machine (if all required dependencies
+can be satisfied). Debugging is typically done by attaching the debugger (Visual Studio in most cases) to
+the running process or launching an executable and attaching to the process.
+With kernel code, testing is typically done on another machine, usually a virtual machine hosted on
+the developer’s machine. This ensures that if a BSOD occurs, the developer’s machine is unaffected.
+Debugging kernel code must be done with another machine, where the actual driver is executing. This
+is because hitting a breakpoint in kernel-mode freezes the entire machine, not just a particular process.
+The developer’s machine hosts the debugger itself, while the second machine (again, usually a virtual
+machine) executes the driver code. These two machines must be connected through some mechanism
+so data can flow between the host (where the debugger is running) and the target. We’ll look at kernel
+debugging in more detail in chapter 5.
+
+===== [PDF page 43] =====
+Chapter 3: Kernel Programming Basics
+37
+Debug vs. Release Builds
+Just like with user-mode projects, building kernel drivers can be done in Debug or Release mode. The
+differences are similar to their user-mode counterparts - Debug builds use no compiler optimizations by
+default, but are easier to debug. Release builds utilize full compiler optimizations by default to produce
+the fastest and smallest code possible. There are a few differences, however.
+The terms in kernel terminology are Checked (Debug) and Free (Release). Although Visual Studio kernel
+projects continue to use the Debug/Release terms, older documentation uses the Checked/Free terms. From
+a compilation perspective, kernel Debug builds define the symbol DBG and set its value to 1 (compared to
+the _DEBUG symbol defined in user mode). This means you can use the DBG symbol to distinguish between
+Debug and Release builds with conditional compilation. This is, for example, what the KdPrint macro
+does: in Debug builds, it compiles to calling DbgPrint, while in Release builds it compiles to nothing,
+resulting in KdPrint calls having no effect in Release builds. This is usually what you want because these
+calls are relatively expensive. We’ll discuss other ways of logging information in chapter 5.
+The Kernel API
+Kernel drivers use exported functions from kernel components. These functions will be referred to as the
+Kernel API. Most functions are implemented within the kernel module itself (NtOskrnl.exe), but some may
+be implemented by other kernel modules, such the HAL (hal.dll).
+The Kernel API is a large set of C functions. Most of these start with a prefix suggesting the component
+implementing that function. Table 3-2 shows some of the common prefixes and their meaning:
+Table 3-2: Common kernel API prefixes
+Prefix
+Meaning
+Example
+Ex
+General executive functions
+ExAllocatePoolWithTag
+Ke
+General kernel functions
+KeAcquireSpinLock
+Mm
+Memory manager
+MmProbeAndLockPages
+Rtl
+General runtime library
+RtlInitUnicodeString
+FsRtl
+file system runtime library
+FsRtlGetFileSize
+Flt
+file system mini-filter library
+FltCreateFile
+Ob
+Object manager
+ObReferenceObject
+Io
+I/O manager
+IoCompleteRequest
+Se
+Security
+SeAccessCheck
+Ps
+Process manager
+PsLookupProcessByProcessId
+Po
+Power manager
+PoSetSystemState
+Wmi
+Windows management instrumentation
+WmiTraceMessage
+Zw
+Native API wrappers
+ZwCreateFile
+
+===== [PDF page 44] =====
+Chapter 3: Kernel Programming Basics
+38
+Table 3-2: Common kernel API prefixes
+Prefix
+Meaning
+Example
+Hal
+Hardware abstraction layer
+HalExamineMBR
+Cm
+Configuration manager (registry)
+CmRegisterCallbackEx
+If you take a look at the exported functions list from NtOsKrnl.exe, you’ll find many functions that are
+not documented in the Windows Driver Kit; this is just a fact of a kernel developer’s life - not everything
+is documented.
+One set of functions bears discussion at this point - the Zw prefixed functions. These functions mirror
+native APIs available as gateways from NtDll.Dll with the actual implementation provided by the
+Executive. When an Nt function is called from user mode, such as NtCreateFile, it reaches the Executive
+at the actual NtCreateFile implementation. At this point, NtCreateFile might do various checks
+based on the fact that the original caller is from user mode. This caller information is stored on a thread-
+by-thread basis, in the undocumented PreviousMode member in the KTHREAD structure for each thread.
+You can query the previous processor mode by calling the documented ExGetPreviousMode API.
+On the other hand, if a kernel driver needs to call a system service, it should not be subjected to the
+same checks and constraints imposed on user-mode callers. This is where the Zw functions come into
+play. Calling a Zw function sets the previous caller mode to KernelMode (0) and then invokes the
+native function. For example, calling ZwCreateFile sets the previous caller to KernelMode and then
+calls NtCreateFile, causing NtCreateFile to bypass some security and buffer checks that would
+otherwise be performed. The bottom line is that kernel drivers should call the Zw functions unless there
+is a compelling reason to do otherwise.
+Functions and Error Codes
+Most kernel API functions return a status indicating success or failure of an operation. This is typed as
+NTSTATUS, a signed 32-bit integer. The value STATUS_SUCCESS (0) indicates success. A negative value
+indicates some kind of error. You can find all the defined NTSTATUS values in the file <ntstatus.h>.
+Most code paths don’t care about the exact nature of the error, and so testing the most significant bit is
+enough to find out whether an error occurred. This can be done with the NT_SUCCESS macro. Here is an
+example that tests for failure and logs an error if that is the case:
+
+===== [PDF page 45] =====
+Chapter 3: Kernel Programming Basics
+39
+NTSTATUS DoWork() {
+NTSTATUS status = CallSomeKernelFunction();
+if(!NT_SUCCESS(Statue)) {
+KdPirnt((L"Error occurred: 0x%08X\n", status));
+return status;
+}
+// continue with more operations
+return STATUS_SUCCESS;
+}
+In some cases, NTSTATUS values are returned from functions that eventually bubble up to user mode. In
+these cases, the STATUS_xxx value is translated to some ERROR_yyy value that is available to user-mode
+through the GetLastError function. Note that these are not the same numbers; for one, error codes in
+user-mode have positive values (zero is still success). Second, the mapping is not one-to-one. In any case,
+this is not generally a concern for a kernel driver.
+Internal kernel driver functions also typically return NTSTATUS to indicate their success/failure status.
+This is usually convenient, as these functions make calls to kernel APIs and so can propagate any error
+by simply returning the same status they got back from the particular API. This also implies that the
+“real” return values from driver functions is typically returned through pointers or references provided as
+arguments to the function.
+Return NTSTATUS from your own functions. It will make it easier and consistent to report
+errors.
+Strings
+The kernel API uses strings in many scenarios as needed. In some cases, these strings are simple Unicode
+pointers (wchar_t* or one of their typedefs such as WCHAR*), but most functions dealing with strings
+expect a structure of type UNICODE_STRING.
+The term Unicode as used in this book is roughly equivalent to UTF-16, which means 2 bytes per character.
+This is how strings are stored internally within kernel components. Unicode in general is a set of standards
+related to character encoding. You can find more information at https://unicode.org.
+The UNICODE_STRING structure represents a string with its length and maximum length known. Here is
+a simplified definition of the structure:
+
+===== [PDF page 46] =====
+Chapter 3: Kernel Programming Basics
+40
+typedef struct _UNICODE_STRING {
+USHORT Length;
+USHORT MaximumLength;
+PWCH
+Buffer;
+} UNICODE_STRING;
+typedef UNICODE_STRING *PUNICODE_STRING;
+typedef const UNICODE_STRING *PCUNICODE_STRING;
+The Length member is in bytes (not characters) and does not include a Unicode-NULL terminator, if one
+exists (a NULL terminator is not mandatory). The MaximumLength member is the number of bytes the
+string can grow to without requiring a memory reallocation.
+Manipulating UNICODE_STRING structures is typically done with a set of Rtl functions that deal
+specifically with strings. Table 3-3 lists some of the common functions for string manipulation provided
+by the Rtl functions.
+Table 3-3: Common UNICODE_STRING functions
+Function
+Description
+RtlInitUnicodeString
+Initializes a UNICODE_STRING based on an existing C-string
+pointer. It sets Buffer, then calculates the Length and sets
+MaximumLength to the same value. Note that this function does
+not allocate any memory - it just initializes the internal members.
+RtlCopyUnicodeString
+Copies one UNICODE_STRING to another. The destination string
+pointer (Buffer) must be allocated before the copy and
+MaximumLength set appropriately.
+RtlCompareUnicodeString
+Compares two UNICODE_STRINGs (equal, less, greater), specifying
+whether to do a case sensitive or insensitive comparison.
+RtlEqualUnicodeString
+Compares two UNICODE_STRINGs for equality, with case
+sensitivity specification.
+RtlAppendUnicodeStringToString
+Appends one UNICODE_STRING to another.
+RtlAppendUnicodeToString
+Appends UNICODE_STRING to a C-style string.
+In addition to the above functions, there are functions that work on C-string pointers. Moreover, some of
+the well-known string functions from the C Runtime Library are implemented within the kernel as well
+for convenience: wcscpy_s, wcscat_s, wcslen, wcscpy_s, wcschr, strcpy, strcpy_s and others.
+The wcs prefix works with C Unicode strings, while the str prefix works with C Ansi strings. The
+suffix _s in some functions indicates a safe function, where an additional argument indicating
+the maximum length of the string must be provided so the function would not transfer more
+data than that size.
+Never use the non-safe functions. You can include <dontuse.h> to get errors for deprecated
+functions if you do use these in code.
+
+===== [PDF page 47] =====
+Chapter 3: Kernel Programming Basics
+41
+Dynamic Memory Allocation
+Drivers often need to allocate memory dynamically. As discussed in chapter 1, kernel thread stack size is
+rather small, so any large chunk of memory should be allocated dynamically.
+The kernel provides two general memory pools for drivers to use (the kernel itself uses them as well).
+• Paged pool - memory pool that can be paged out if required.
+• Non-Paged Pool - memory pool that is never paged out and is guaranteed to remain in RAM.
+Clearly, the non-paged pool is a “better” memory pool as it can never incur a page fault. We’ll see
+later in this book that some cases require allocating from non-paged pool. Drivers should use this pool
+sparingly, only when necessary. In all other cases, drivers should use the paged pool. The POOL_TYPE
+enumeration represents the pool types. This enumeration includes many “types” of pools, but only three
+should be used by drivers: PagedPool, NonPagedPool, NonPagedPoolNx (non-page pool without
+execute permissions).
+Table 3-4 summarizes the most common functions used for working with the kernel memory pools.
+Table 3-4: Functions for kernel memory pool allocation
+Function
+Description
+ExAllocatePool
+Allocate memory from one of the pools with a default tag. This function is
+considered obsolete. The next function in this table should be used instead
+ExAllocatePoolWithTag
+Allocate memory from one of the pools with the specified tag
+ExAllocatePoolZero
+Same as ExAllocatePoolWithTag, but zeroes out the memory block
+ExAllocatePoolWithQuotaTag
+Allocate memory from one of the pools with the specified tag and charge
+the current process quota for the allocation
+ExFreePool
+Free an allocation. The function knows from which pool the allocation
+was made
+ExAllocatePool calls ExAllocatePoolWithTag using the tag enoN (the word “none” in
+reverse). Older Windows versions used ‘ mdW (WDM in reverse). You should avoid
+this function and use ExAllocatePoolWithTag‘ instead.
+ExAllocatePoolZero
+is
+implemented
+inline
+in
+wdm.h
+by
+calling
+ExAllocatePoolWithTag and adding the POOL_ZERO_ALLOCATION (=1024) flag to
+the pool type.
+Other memory management functions are covered in chapter 8, “Advanced Programming Techniques”.
+
+===== [PDF page 48] =====
+Chapter 3: Kernel Programming Basics
+42
+The tag argument allows “tagging” an allocation with a 4-byte value. Typically this value is comprised
+of up to 4 ASCII characters logically identifying the driver, or some part of the driver. These tags can be
+used to help identify memory leaks - if any allocations tagged with the driver’s tag remain after the driver
+is unloaded. These pool allocations (with their tags) can be viewed with the Poolmon WDK tool, or my
+own PoolMonXv2 tool (downloadable from http://www.github.com/zodiacon/AllTools). Figure 3-1 shows
+a screenshot of PoolMonXv2.
+Figure 3-1: PoolMonXv2
+You must use tags comprised of printable ASCII characters. Otherwise, running the driver
+under the control of the Driver Verifier (described in chapter 11) would lead to Driver Verifier
+complaining.
+The following code example shows memory allocation and string copying to save the registry path passed
+to DriverEntry, and freeing that string in the Unload routine:
+
+===== [PDF page 49] =====
+Chapter 3: Kernel Programming Basics
+43
+// define a tag (because of little endianness, viewed as 'abcd')
+#define DRIVER_TAG 'dcba'
+UNICODE_STRING g_RegistryPath;
+extern "C" NTSTATUS
+DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+UNREFERENCED_PARAMETER(DriverObject);
+DriverObject->DriverUnload = SampleUnload;
+g_RegistryPath.Buffer = (WCHAR*)ExAllocatePoolWithTag(PagedPool,
+RegistryPath->Length, DRIVER_TAG);
+if (g_RegistryPath.Buffer == nullptr) {
+KdPrint(("Failed to allocate memory\n"));
+return STATUS_INSUFFICIENT_RESOURCES;
+}
+g_RegistryPath.MaximumLength = RegistryPath->Length;
+RtlCopyUnicodeString(&g_RegistryPath,
+(PCUNICODE_STRING)RegistryPath);
+// %wZ is for UNICODE_STRING objects
+KdPrint(("Original registry path: %wZ\n", RegistryPath));
+KdPrint(("Copied registry path: %wZ\n", &g_RegistryPath));
+//...
+return STATUS_SUCCESS;
+}
+void SampleUnload(_In_ PDRIVER_OBJECT DriverObject) {
+UNREFERENCED_PARAMETER(DriverObject);
+ExFreePool(g_RegistryPath.Buffer);
+KdPrint(("Sample driver Unload called\n"));
+}
+Linked Lists
+The kernel uses circular doubly linked lists in many of its internal data structures. For example, all processes
+on the system are managed by EPROCESS structures, connected in a circular doubly linked list, where its
+head is stored the kernel variable PsActiveProcessHead.
+All these lists are built in the same way, centered around the LIST_ENTRY structure defined like so:
+
+===== [PDF page 50] =====
+Chapter 3: Kernel Programming Basics
+44
+typedef struct _LIST_ENTRY {
+struct _LIST_ENTRY *Flink;
+struct _LIST_ENTRY *Blink;
+} LIST_ENTRY, *PLIST_ENTRY;
+Figure 3-2 depicts an example of such a list containing a head and three instances.
+Figure 3-2: Circular linked list
+One such structure is embedded inside the real structure of interest. For example, in the EPROCESS
+structure, the member ActiveProcessLinks is of type LIST_ENTRY, pointing to the next and previous
+LIST_ENTRY objects of other EPROCESS structures. The head of a list is stored separately; in the case of
+the process, that’s PsActiveProcessHead.
+To get the pointer to the actual structure of interest given the address of a LIST_ENTRY can be obtained
+with the CONTAINING_RECORD macro.
+For example, suppose you want to manage a list of structures of type MyDataItem defined like so:
+struct MyDataItem {
+// some data members
+LIST_ENTRY Link;
+// more data members
+};
+When working with these linked lists, we have a head for the list, stored in a variable. This means that
+natural traversal is done by using the Flink member of the list to point to the next LIST_ENTRY in the
+list. Given a pointer to the LIST_ENTRY, what we’re really after is the MyDataItem that contains this
+list entry member. This is where the CONTAINING_RECORD comes in:
+MyDataItem* GetItem(LIST_ENTRY* pEntry) {
+return CONTAINING_RECORD(pEntry, MyDataItem, Link);
+}
+The macro does the proper offset calculation and does the casting to the actual data type (MyDataItem in
+the example).
+Table 3-5 shows the common functions for working with these linked lists. All operations use constant
+time.
+
+===== [PDF page 51] =====
+Chapter 3: Kernel Programming Basics
+45
+Table 3-5: Functions for working with circular linked lists
+Function
+Description
+InitializeListHead
+Initializes a list head to make an empty list. The forward and back
+pointers point to the forward pointer.
+InsertHeadList
+Insert an item to the head of the list.
+InsertTailList
+Insert an item to the tail of the list.
+IsListEmpty
+Check if the list is empty.
+RemoveHeadList
+Remove the item at the head of the list.
+RemoveTailList
+Remove the item at the tail of the list.
+RemoveEntryList
+Remove a specific item from the list.
+ExInterlockedInsertHeadList
+Insert an item at the head of the list atomically by using the specified
+spinlock.
+ExInterlockedInsertTailList
+Insert an item at the tail of the list atomically by using the specified
+spinlock.
+ExInterlockedRemoveHeadList
+Remove an item from the head of the list atomically by using the
+specified spinlock.
+The last three functions in table 3-4 perform the operation atomically using a synchronization primitive
+called a spin lock. Spin locks are discussed in chapter 6.
+The Driver Object
+We’ve already seen that the DriverEntry function accepts two arguments, the first is a driver object
+of some kind. This is a semi-documented structure called DRIVER_OBJECT defined in the WDK headers.
+“Semi-documented” means that some of its members are documented for driver’s use and some are not.
+This structure is allocated by the kernel and partially initialized. Then it’s provided to DriverEntry (and
+before the driver unloads to the Unload routine as well). The role of the driver at this point is to further
+initialize the structure to indicate what operations are supported by the driver.
+We’ve seen one such “operation” in chapter 2 - the Unload routine. The other important set of operations
+to initialize are called Dispatch Routines. This is an array of function pointers, stored in the in the
+MajorFunction member of DRIVER_OBJECT. This set specifies which operations the driver supports,
+such as Create, Read, Write, and so on. These indices are defined with the IRP_MJ_ prefix. Table 3-6 shows
+some common major function codes and their meaning.
+
+===== [PDF page 52] =====
+Chapter 3: Kernel Programming Basics
+46
+Table 3-6: Common major function codes
+Major function
+Description
+IRP_MJ_CREATE (0)
+Create operation. Typically invoked for CreateFile or
+ZwCreateFile calls.
+IRP_MJ_CLOSE (2)
+Close operation. Normally invoked for CloseHandle or
+ZwClose.
+IRP_MJ_READ (3)
+Read operation. Typically invoked for ReadFile,
+ZwReadFile and similar read APIs.
+IRP_MJ_WRITE (4)
+Write operation. Typically invoked for WriteFile,
+ZwWriteFile, and similar write APIs.
+IRP_MJ_DEVICE_CONTROL (14)
+Generic call to a driver, invoked because of
+DeviceIoControl or ZwDeviceIoControlFile calls.
+IRP_MJ_INTERNAL_DEVICE_CONTROL (15)
+Similar to the previous one, but only available for kernel-mode
+callers.
+IRP_MJ_SHUTDOWN (16)
+Called when the system shuts down if the driver has registered
+for shutdown notification with
+IoRegisterShutdownNotification.
+IRP_MJ_CLEANUP (18)
+Invoked when the last handle to a file object is closed, but the
+file object’s reference count is not zero.
+IRP_MJ_PNP (31)
+Plug and play callback invoked by the Plug and Play Manager.
+Generally interesting for hardware-based drivers or filters to
+such drivers.
+IRP_MJ_POWER (22)
+Power callback invoked by the Power Manager. Generally
+interesting for hardware-based drivers or filters to such drivers.
+Initially, the MajorFunction array is initialized by the kernel to point to a kernel internal routine,
+IopInvalidDeviceRequest, which returns a failure status to the caller, indicating the operation is
+not supported. This means the driver, in its DriverEntry routine only needs to initialize the actual
+operations it supports, leaving all the other entries in their default values.
+For example, our Sample driver at this point does not support any dispatch routines, which means there is
+no way to communicate with the driver. A driver must at least support the IRP_MJ_CREATE and IRP_-
+MJ_CLOSE operations, to allow opening a handle to one of the device objects for the driver. We’ll put these
+ideas into practice in the next chapter.
+Object Attributes
+One of the common structures that shows up in many kernel APIs is OBJECT_ATTRIBUTES, defined like
+so:
+
+===== [PDF page 53] =====
+Chapter 3: Kernel Programming Basics
+47
+typedef struct _OBJECT_ATTRIBUTES {
+ULONG Length;
+HANDLE RootDirectory;
+PUNICODE_STRING ObjectName;
+ULONG Attributes;
+PVOID SecurityDescriptor;
+// SECURITY_DESCRIPTOR
+PVOID SecurityQualityOfService;
+// SECURITY_QUALITY_OF_SERVICE
+} OBJECT_ATTRIBUTES;
+typedef OBJECT_ATTRIBUTES *POBJECT_ATTRIBUTES;
+typedef CONST OBJECT_ATTRIBUTES *PCOBJECT_ATTRIBUTES;
+The structure is typically initialized with the InitializeObjectAttributes macro, that allows
+specifying all the structure members except Length (set automatically by the macro), and Securi-
+tyQualityOfService, which is not normally needed. Here is the description of the members:
+• ObjectName is the name of the object to be created/located, provided as a pointer to a UNICODE_-
+STRING. In some cases it may be ok to set it to NULL. For example, the ZwOpenProcess allows
+opening a handle to a process given its PID. Since processes don’t have names, the ObjectName in
+this case should be initialized to NULL.
+• RootDirectory is an optional directory in the object manager namespace if the name of the object
+is relative one. If ObjectName specifies a fully-qualified name, RootDirectory should be set to
+NULL.
+• Attributes allows specifying a set of flags that has effect on the operation in question. Table 3-7
+shows the defined flags and their meaning.
+• SecurityDescriptor is an optional security descriptor (SECURITY_DESCRIPTOR) to set on the
+newly created object. NULL indicates the new object gets a default security descriptor, based on the
+caller’s token.
+• SecurityQualityOfService is an optional set of attributes related to the new object’s imper-
+sonation level and context tracking mode. It has no meaning for most object types. Consult the
+documentation for more information.
+Table 3-7: Object attributes flags
+Flag (OBJ_)
+Description
+INHERIT (2)
+The returned handle should be marked as inheritable
+PERMANENT (0x10)
+The object created should be marked as permanent.
+Permanent objects have an additional reference count that
+prevents them from dying even if all handles to them are
+closed
+EXCLUSIVE (0x20)
+If creating an object, the object is created with exclusive
+access. No other handles can be opened to the object. If
+opening an object, exclusive access is requested, which is
+granted only if the object was originally created with this flag
+
+===== [PDF page 54] =====
+Chapter 3: Kernel Programming Basics
+48
+Table 3-7: Object attributes flags
+Flag (OBJ_)
+Description
+CASE_INSENSITIVE (0x40)
+When opening an object, perform a case insensitive search for
+its name. Without this flag, the name must match exactly
+OPENIF (0x80)
+Open the object if it exists. Otherwise, fail the operation
+(don’t create a new object)
+OPENLINK (0x100)
+If the object to open is a symbolic link object, open the
+symbolic link object itself, rather than following the symbolic
+link to its target
+KERNEL_HANDLE (0x200)
+The returned handle should be a kernel handle. Kernel
+handles are valid in any process context, and cannot be used
+by user mode code
+FORCE_ACCESS_CHECK (0x400)
+Access checks should be performed even if the object is
+opened in KernelMode access mode
+IGNORE_IMPERSONATED_DEVICEMAP (0x800)
+Use the process device map instead of the user’s if it’s
+impersonating (consult the documentation for more
+information on device maps)
+DONT_REPARSE (0x1000)
+Don’t follow a reparse point, if encountered. Instead an error
+is returned (STATUS_REPARSE_POINT_ENCOUNTERED).
+Reparse points are briefly discussed in chapter 11
+A second way to initialize an OBJECT_ATTRIBUTES structure is available with the RTL_CONSTANT_-
+OBJECT_ATTRIBUTES macro, that uses the most common members to set - the object’s name and the
+attributes.
+Let’s look at a couple of examples that use OBJECT_ATTRIBUTES. The first one is a function that opens
+a handle to a process given its process ID. For this purpose, we’ll use the ZwOpenProcess API, defined
+like so:
+NTSTATUS ZwOpenProcess (
+_Out_
+PHANDLE ProcessHandle,
+_In_
+ACCESS_MASK DesiredAccess,
+_In_
+POBJECT_ATTRIBUTES ObjectAttributes,
+_In_opt_
+PCLIENT_ID ClientId);
+It uses yet another common structure, CLIENT_ID that holds a process and/or a thread ID:
+typedef struct _CLIENT_ID {
+HANDLE UniqueProcess;
+// PID, not handle
+HANDLE UniqueThread;
+// TID, not handle
+} CLIENT_ID;
+typedef CLIENT_ID *PCLIENT_ID;
+To open a process, we need to specify the process ID in the UniqueProcess member. Note that although
+the type of UniqueProcess is HANDLE, it is the unique ID of the process. The reason for the HANDLE type
+
+===== [PDF page 55] =====
+Chapter 3: Kernel Programming Basics
+49
+is that process and thread IDs are generated from a private handle table. This also explains why process
+and thread IDs are always multiple of four (just like normal handles), and why they don’t overlap.
+With these details at hand, here is a process opening function:
+NTSTATUS
+OpenProcess(ACCESS_MASK accessMask, ULONG pid, PHANDLE phProcess) {
+CLIENT_ID cid;
+cid.UniqueProcess = ULongToHandle(pid);
+cid.UniqueThread = nullptr;
+OBJECT_ATTRIBUTES procAttributes =
+RTL_CONSTANT_OBJECT_ATTRIBUTES(nullptr, OBJ_KERNEL_HANDLE);
+return ZwOpenProcess(phProcess, accessMask, &procAttributes, &cid);
+}
+The ULongToHandle function performs the required casts so that the compiler is happy (HANDLE is
+64-bit on a 64-bit system, but ULONG is always 32-bit). The only member used in the above code from
+OBJECT_ATTRIBUTES is the Attributes flags.
+The second example is a function that opens a handle to a file for read access, by using the ZwOpenFile
+API, defined like so:
+NTSTATUS ZwOpenFile(
+_Out_
+PHANDLE FileHandle,
+_In_
+ACCESS_MASK DesiredAccess,
+_In_
+POBJECT_ATTRIBUTES ObjectAttributes,
+_Out_
+PIO_STATUS_BLOCK IoStatusBlock,
+_In_
+ULONG ShareAccess,
+_In_
+ULONG OpenOptions);
+A full discussion of the parameters to ZwOpenFile is reserved for chapter 11, but one thing is obvious:
+the file name itself is specified using the OBJECT_ATTRIBUTES structure - there is no separate parameter
+for that. Here is the full function opening a handle to a file for read access:
+NTSTATUS OpenFileForRead(PCWSTR path, PHANDLE phFile) {
+UNICODE_STRING name;
+RtlInitUnicodeString(&name, path);
+OBJECT_ATTRIBUTES fileAttributes;
+InitializeObjectAttributes(&fileAttributes, &name,
+OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+IO_STATUS_BLOCK ioStatus;
+return ZwOpenFile(phFile, FILE_GENERIC_READ,
+&fileAttributes, &ioStatus, FILE_SHARE_READ, 0);
+}
+
+===== [PDF page 56] =====
+Chapter 3: Kernel Programming Basics
+50
+InitializeObjectAttributes is used to initialize the OBJECT_ATTRIBUTES structure, although the
+RTL_CONSTANT_OBJECT_ATTRIBUTES could have been used just as well, since we’re only specifying
+the name and attributes. Notice the need to turn the passed-in NULL-terminated C-string pointer into a
+UNICODE_STRING with RtlInitUnicodeString.
+Device Objects
+Although a driver object may look like a good candidate for clients to talk to, this is not the case. The
+actual communication endpoints for clients are device objects. Device objects are instances of the semi-
+documented DEVICE_OBJECT structure. Without device objects, there is no one to talk to. This means
+that at least one device object should be created by the driver and given a name, so that it may be contacted
+by clients.
+The CreateFile function (and its variants) accepts a first argument which is called “file name” in the
+documentation, but really this should point to a device object’s name, where an actual file system file is
+just one particular case. The name CreateFile is somewhat misleading - the word “file” here means
+“file object”. Opening a handle to a file or device creates an instance of the kernel structure FILE_OBJECT,
+another semi-documented structure.
+More precisely, CreateFile accepts a symbolic link, a kernel object that knows how to point to another
+kernel object. (You can think of a symbolic link as similar in principle to a file system shortcut.) All the
+symbolic links that can be used from the user mode CreateFile or CreateFile2 calls are located in
+the Object Manager directory named ??. You can see the contents of this directory with the Sysinternals
+WinObj tool. Figure 3-3 shows this directory (named Global?? in WinObj).
+Figure 3-3: Symbolic links directory in WinObj
+Some of the names seem familiar, such as C:, Aux, Con, and others. Indeed, these are valid “file names”
+for CreateFile calls. Other entries look like long cryptic strings, and these in fact are generated by the
+
+===== [PDF page 57] =====
+Chapter 3: Kernel Programming Basics
+51
+I/O system for hardware-based drivers that call the IoRegisterDeviceInterface API. These types
+of symbolic links are not useful for the purpose of this book.
+Most of the symbolic links in the \?? directory point to an internal device name under the \Device directory.
+The names in this directory are not directly accessible by user-mode callers. But they can be accessed by
+kernel callers using the IoGetDeviceObjectPointer API.
+A canonical example is the driver for Process Explorer. When Process Explorer is launched with
+administrator rights, it installs a driver. This driver gives Process Explorer powers beyond those that can
+be obtained by user-mode callers, even if running elevated. For example, Process Explorer in its Threads
+dialog for a process can show the complete call stack of a thread, including functions in kernel mode. This
+type of information is not possible to obtain from user mode; its driver provides the missing information.
+The driver installed by Process Explorer creates a single device object so that Process Explorer is able to
+open a handle to that device and make requests. This means that the device object must be named, and
+must have a symbolic link in the ?? directory; and it’s there, called PROCEXP152, probably indicating
+driver version 15.2 (at the time of writing). Figure 3-4 shows this symbolic link in WinObj.
+Figure 3-4: Process Explorer’s symbolic link in WinObj
+Notice the symbolic link for Process Explorer’s device points to \Device\PROCEXP152, which is the
+internal name only accessible to kernel callers (and the native APIs NtOpenFile and NtCreateFile,
+as shown in the next section). The actual CreateFile call made by Process Explorer (or any other client)
+based on the symbolic link must be prepended with \\.\. This is necessary so that the I/O manager’s
+parser will not assume the string “PROCEXP152” refers to a file with no extension in the current directory.
+Here is how Process Explorer would open a handle to its device object (note the double backslashes because
+of the backslash being an escape character in C/C++):
+HANDLE hDevice = CreateFile(L"\\\\.\\PROCEXP152",
+GENERIC_WRITE | GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+0, nullptr);
+With C++ 11 and later, you can write strings without escaping the backslash character. The
+device path in the above code can be written like so: LR"(\\.\PROCEXP152)". L indicates
+Unicode (as always), while anything between R"( and )" is not escaped.
+
+===== [PDF page 58] =====
+Chapter 3: Kernel Programming Basics
+52
+You can try the above code yourself. If Process Explorer has run elevated at least once on the system
+since boot, its driver should be running (you can verify with the tool itself), and the call to CreateFile
+will succeed if the client is running elevated.
+A driver creates a device object using the IoCreateDevice function. This function allocates and
+initializes a device object structure and returns its pointer to the caller. The device object instance is
+stored in the DeviceObject member of the DRIVER_OBJECT structure. If more than one device object
+is created, they form a singly linked list, where the member NextDevice of the DEVICE_OBJECT points
+to the next device object. Note that the device objects are inserted at the head of the list, so the first device
+object created is stored last; its NextDevice points to NULL. These relationships are depicted in figure
+3-5.
+Figure 3-5: Driver and Device objects
+Opening Devices Directly
+The existence of a symbolic link makes it easy to open a handle to a device with the documented
+CreateFile user-mode API (or from the ZwOpenFile API in the kernel). It is sometimes useful,
+however, to be able to open device objects without going through a symbolic link. For example, a device
+object might not have a symbolic link, because its driver decided (for whatever reason) not to provide one.
+The native NtOpenFile (and NtCreateFile) function can be used to open a device object directly.
+Microsoft never recommends using native APIs, but this function is somewhat documented for user-mode
+use . Its definition is available in the <Winternl.h> header file:
+NTAPI NtOpenFile (
+OUT PHANDLE FileHandle,
+IN
+ACCESS_MASK DesiredAccess,
+IN
+POBJECT_ATTRIBUTES ObjectAttributes,
+OUT PIO_STATUS_BLOCK IoStatusBlock,
+IN
+ULONG ShareAccess,
+IN
+ULONG OpenOptions);
+
+===== [PDF page 59] =====
+Chapter 3: Kernel Programming Basics
+53
+Notice the similarity to the ZwOpenFile we used in an earlier section - this is the same function prototype,
+just invoked here from user mode, eventually to land at NtOpenFile within the I/O manager. The function
+requires usage of an OBJECT_ATTRIBUTES structure, described earlier in this chapter.
+The above prototype uses old macros such as IN, OUT and others. These have been replaced by SAL
+annotations. Unfortunately, some header files were not yet converted to SAL.
+To demonstrate using NtOpenFile from user mode, we’ll create an application to play a single sound.
+Normally, the Beep Windows user-mode API provides such a service:
+BOOL Beep(
+_In_ DWORD dwFreq,
+_In_ DWORD dwDuration);
+The function accepts the frequency to play (in Hertz), and the duration to play, in milliseconds. The
+function is synchronous, meaning it does not return until the duration has elapsed.
+The Beep API works by calling a device named \Device\Beep (you can find it in WinObj), but the beep
+device driver does not create a symbolic link for it. However, we can open a handle to the beep device
+using NtOpenFile. Then, to play a sound, we can use the DeviceIoContol function with the correct
+parameters. Although it’s not too difficult to reverse engineer the beep driver workings, fortunately we
+don’t have to. The SDK provides the <ntddbeep.h> file with the required definitions, including the device
+name itself.
+We’ll start by creating a C++ Console application in Visual Studio. Before we get to the main function, we
+need some #includes:
+#include <Windows.h>
+#include <winternl.h>
+#include <stdio.h>
+#include <ntddbeep.h>
+<winternl.h> provides the definition for NtOpenFile (and related data structures), while <ntddbeep.h>
+provides the beep-specific definitions.
+Since we will be using NtOpenFile, we must also link against NtDll.Dll, which we can do by adding a
+#pragma to the source code, or add the library to the linker settings in the project’s properties. Let’s go
+with the former, as it’s easier, and is not tied to the project’s properties:
+#pragma comment(lib, "ntdll")
+Without the above linkage, the linker would issue an “unresolved external” error.
+
+===== [PDF page 60] =====
+Chapter 3: Kernel Programming Basics
+54
+Now we can start writing main, where we accept optional command line arguments indicating the
+frequency and duration to play:
+int main(int argc, const char* argv[]) {
+printf("beep [<frequency> <duration_in_msec>]\n");
+int freq = 800, duration = 1000;
+if (argc > 2) {
+freq = atoi(argv[1]);
+duration = atoi(argv[2]);
+}
+The next step is to open the device handle using NtOpenFile:
+HANDLE hFile;
+OBJECT_ATTRIBUTES attr;
+UNICODE_STRING name;
+RtlInitUnicodeString(&name, L"\\Device\\Beep");
+InitializeObjectAttributes(&attr, &name, OBJ_CASE_INSENSITIVE,
+nullptr, nullptr);
+IO_STATUS_BLOCK ioStatus;
+NTSTATUS status = ::NtOpenFile(&hFile, GENERIC_WRITE, &attr, &ioStatus, 0, 0);
+The line to initialize the device name can be replaced with:
+RtlInitUnicodeString(&name, DD_BEEP_DEVICE_NAME_U);
+The DD_BEEP_DEVICE_NAME_U macro is conveniently supplied as part of <ntddbeep.h>.
+If the call succeeds, we can play the sound. To do that, we call DeviceIoControl with a control code
+defined in <ntddbeep.h> and use a structure defined there as well to fill in the frequency and duration:
+if (NT_SUCCESS(status)) {
+BEEP_SET_PARAMETERS params;
+params.Frequency = freq;
+params.Duration = duration;
+DWORD bytes;
+//
+// play the sound
+//
+printf("Playing freq: %u, duration: %u\n", freq, duration);
+::DeviceIoControl(hFile, IOCTL_BEEP_SET, &params, sizeof(params),
+nullptr, 0, &bytes, nullptr);
+
+===== [PDF page 61] =====
+Chapter 3: Kernel Programming Basics
+55
+//
+// the sound starts playing and the call returns immediately
+// Wait so that the app doesn't close
+//
+::Sleep(duration);
+::CloseHandle(hFile);
+}
+The input buffer passed to DeviceIoControl should be a BEEP_SET_PARAMETERS structure, which
+we pass in along with its size. The last piece of the puzzle is to use the Sleep API to wait based on the
+duration, otherwise the handle to the device would be closed and the sound cut off.
+Write an application that plays an array of sounds by leveraging the above code.
+Summary
+In this chapter, we looked at some of the fundamental kernel data structures, concepts, and APIs. In the next
+chapter, we’ll build a complete driver, and a client application, expanding on the information presented
+thus far.

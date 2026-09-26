@@ -1,0 +1,1470 @@
+CHAPTER 8: Advanced Programming Techniques (Part 1) (PDF pages 230-267)
+
+===== [PDF page 230] =====
+Chapter 8: Advanced Programming
+Techniques (Part 1)
+In this chapter we’ll examine various techniques of various degrees of usefulness to driver developers.
+In this chapter:
+• Driver Created Threads
+• Memory Management
+• Calling Other Drivers
+• Putting it All Together: The Melody Driver
+• Invoking System Services
+Driver Created Threads
+We’ve seen how to create work items in chapter 6. Work items are useful when some code needs to execute
+on a separate thread, and that code is “bound” in time - that is, it’s not too long, so that the driver doesn’t
+“steal” a thread from the kernel worker threads. For long operations, however, it’s preferable that drivers
+create their own seperate thread(s). Two functions are available for this purpose:
+NTSTATUS PsCreateSystemThread(
+_Out_ PHANDLE ThreadHandle,
+_In_
+ULONG DesiredAccess,
+_In_opt_
+POBJECT_ATTRIBUTES ObjectAttributes,
+_In_opt_
+HANDLE ProcessHandle,
+_Out_opt_ PCLIENT_ID ClientId,
+_In_ PKSTART_ROUTINE StartRoutine,
+_In_opt_ PVOID StartContext);
+NTSTATUS IoCreateSystemThread(
+// Win 8 and later
+_Inout_ PVOID IoObject,
+_Out_ PHANDLE ThreadHandle,
+_In_
+ULONG DesiredAccess,
+_In_opt_
+POBJECT_ATTRIBUTES ObjectAttributes,
+
+===== [PDF page 231] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+225
+_In_opt_
+HANDLE ProcessHandle,
+_Out_opt_ PCLIENT_ID ClientId,
+_In_ PKSTART_ROUTINE StartRoutine,
+_In_opt_ PVOID StartContext);
+Both functions have the same set of parameters except the additional first parameter to IoCreateSys-
+temThread. The latter function takes an additional reference on the object passed in (which must be
+a device object or a driver object), so the driver is not unloaded prematurely while the thread is alive.
+IoCreateSystemThread is only available for Windows 8 and later systems. Here is a description of the
+other parameters:
+• ThreadHandle is the address of a handle to the created thread if successful. The driver must use
+ZwClose to close the handle at some point.
+• DesiredAccess is the access mask requested. Drivers should simply use THREAD_ALL_ACCESS
+to get all possible access with the resulting handle.
+• ObjectAttributes is the standard OBJECT_ATTRIBUTES structure. Most members have no
+meaning for a thread. The most common attributes to request of the returned handle is OBJ_KER-
+NEL_HANDLE, but it’s not needed if the thread is to be created in the System process - just pass
+NULL, which will always return a kernel handle.
+• ProcessHandle is a handle to the process where this thread should be created. Drivers should
+pass NULL to indicate the thread should be part of the System process so it’s not tied to any specific
+process’ lifetime.
+• ClientId is an optional output structure, providing the process and thread ID of the newly created
+thread. In most cases, this information is not needed, and NULL can be specified.
+• StartRoutine is the function to execute in a separate thread of execution. This function must
+have the following prototype:
+VOID KSTART_ROUTINE (_In_ PVOID StartContext);
+The StartContext value is provided by the last parameter to Ps/IoCreateSystemThread. This could
+be anything (or NULL) that would give the new thread data to work with.
+The function indicated by StartRoutine will start execution on a separate thread. It’s executed with
+the IRQL being PASSIVE_LEVEL (0) in a critical region (where normal kernel APCs are disabled).
+For PsCreateSystemThread, exiting the thread function is not enough to terminate the thread. An
+explicit call to PsTerminateSystemThread is required to properly manage the thread’s lifetime:
+NTSTATUS PsTerminateSystemThread(_In_ NTSTATUS ExitStatus);
+The exit status is the exit code of the thread, which can be retrieved with PsGetThreadExitStatus if
+desired.
+For IoCreateSystemThread, exiting the thread function is sufficient, as PsTerminateSystemThread
+is called on its behalf when the thread function returns. The exit code of the thread is always STATUS_-
+SUCCESS.
+
+===== [PDF page 232] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+226
+IoCreateSystemThread is a wrapper around PsCreateSystemThread that increments
+the ref count of the passed in device/driver object, calls PsCreateSystemThread and then
+decrements the ref count and calls PsTerminateSystemThread.
+Memory Management
+We have looked at the most common functions for dynamic memory allocation in chapter 3. The most
+useful is ExAllocatePoolWithTag, which we have used multiple times in previous chapters. There are
+other functions for dynamic memory allocation you might find useful. Then, we’ll examine lookaside lists,
+that allow more efficient memory management if fixed-size chunks are needed.
+Pool Allocations
+In addition to ExAllocatePoolWithTag, the Executive provides an extended version that indicates the
+importance of an allocation, taken into account in low memory conditions:
+typedef enum _EX_POOL_PRIORITY {
+LowPoolPriority,
+LowPoolPrioritySpecialPoolOverrun = 8,
+LowPoolPrioritySpecialPoolUnderrun = 9,
+NormalPoolPriority = 16,
+NormalPoolPrioritySpecialPoolOverrun = 24,
+NormalPoolPrioritySpecialPoolUnderrun = 25,
+HighPoolPriority = 32,
+HighPoolPrioritySpecialPoolOverrun = 40,
+HighPoolPrioritySpecialPoolUnderrun = 41
+} EX_POOL_PRIORITY;
+PVOID ExAllocatePoolWithTagPriority (
+_In_ POOL_TYPE PoolType,
+_In_ SIZE_T NumberOfBytes,
+_In_ ULONG Tag,
+_In_ EX_POOL_PRIORITY Priority);
+The priority-related values indicate the importance of succeeding an allocation if system memory is low
+(LowPoolPriority), very low (NormalPoolPriority), or completely out of memory (HighPoolPriority).
+In any case, the driver should be prepared to handle a failure.
+The “special pool” values tell the Executive to make the allocation at the end of a page (“Overrun” values)
+or beginning of a page (“Underrun”) values, so it’s easier to catch buffer overflow or underflow. These
+values should only be used while tracking memory corruptions, as each allocation costs at least one page.
+Starting with Windows 10 version 1909 (and Windows 11), two new pool allocation functions are supported.
+The first is ExAllocatePool2 declared like so:
+
+===== [PDF page 233] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+227
+PVOID ExAllocatePool2 (
+_In_ POOL_FLAGS Flags,
+_In_ SIZE_T NumberOfBytes,
+_In_ ULONG Tag);
+Where the POOL_FLAGS enumeration consists of a combination of values shown in table 8-1:
+Table 8-1: Flags for ExAllocatePool2
+Flag (POOL_FLAG_)
+Must recognize?
+Description
+USE_QUOTA
+Yes
+Charge allocation to calling process
+UNINITIALIZED
+Yes
+Contents of allocated memory is not touched. Without this
+flag, the memory is zeroed out
+CACHE_ALIGNED
+Yes
+Address should be CPU-cache aligned. This is “best effort”
+RAISE_ON_FAILURE
+Yes
+Raises an exception (STATUS_INSUFFICIENT_RESOURCES)
+instead of returning NULL if allocation fails
+NON_PAGED
+Yes
+Allocate from non-paged pool. The memory is executable on
+x86, and non-executable on all other platforms
+PAGED
+Yes
+Allocate from paged pool. The memory is executable on x86,
+and non-executable on all other platforms
+NON_PAGED_EXECUTABLE
+Yes
+Non paged pool with execute permissions
+SPECIAL_POOL
+No
+Allocates from “special” pool (separate from the normal pool
+so it’s easier to find memory corruptions)
+The Must recognize? column indicates whether failure to recognize or satisfy the flag causes the function
+to fail.
+The second allocation function, ExAllocatePool3, is extensible, so new functions of this sort are
+unlikely to pop up in the future:
+PVOID ExAllocatePool3 (
+_In_ POOL_FLAGS Flags,
+_In_ SIZE_T NumberOfBytes,
+_In_ ULONG Tag,
+_In_reads_opt_(ExtendedParametersCount)
+PCPOOL_EXTENDED_PARAMETER ExtendedParameters,
+_In_ ULONG ExtendedParametersCount);
+This function allows customization with an array of “parameters”, where the supported parameter types
+may be extended in future kernel versions. The currently available parameters are defined with the POOL_-
+EXTENDED_PARAMETER_TYPE enumeration:
+
+===== [PDF page 234] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+228
+typedef enum POOL_EXTENDED_PARAMETER_TYPE {
+PoolExtendedParameterInvalidType = 0,
+PoolExtendedParameterPriority,
+PoolExtendedParameterSecurePool,
+PoolExtendedParameterNumaNode,
+PoolExtendedParameterMax
+} POOL_EXTENDED_PARAMETER_TYPE, *PPOOL_EXTENDED_PARAMETER_TYPE;
+The array provided to ExAllocatePool3 consists of structures of type POOL_EXTENDED_PARAMETER,
+each one specifying one parameter:
+typedef struct _POOL_EXTENDED_PARAMETER {
+struct {
+ULONG64 Type : 8;
+ULONG64 Optional : 1;
+ULONG64 Reserved : 64 - 9;
+};
+union {
+ULONG64 Reserved2;
+PVOID Reserved3;
+EX_POOL_PRIORITY Priority;
+POOL_EXTENDED_PARAMS_SECURE_POOL* SecurePoolParams;
+POOL_NODE_REQUIREMENT PreferredNode;
+// ULONG
+};
+} POOL_EXTENDED_PARAMETER, *PPOOL_EXTENDED_PARAMETER;
+The Type member indicates which of the union members is valid for this parameter (POOL_EXTENDED_-
+PARAMETER_TYPE). Optional indicates if the parameter set is optional or required. An optional
+parameter that fails to be satisfied does not cause the ExAllocatePool3 to fail. Based on Type, the
+correct member in the union must be set. Currently, these parameters are available:
+• Priority of the allocation (Priority member)
+• Preferred NUMA node (PreferredNode member)
+• Use secure pool (discussed later, SecurePoolParams member)
+The following example shows using ExAllocatePool3 to achieve the same effect as ExAllocatePool-
+WithTagPriority for non-paged memory:
+
+===== [PDF page 235] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+229
+PVOID AllocNonPagedPriority(ULONG size, ULONG tag, EX_POOL_PRIORITY priority) {
+POOL_EXTENDED_PARAMETER param;
+param.Optional = FALSE;
+param.Type = PoolExtendedParameterPriority;
+param.Priority = priority;
+return ExAllocatePool3(POOL_FLAG_NON_PAGED, size, tag, &param, 1);
+}
+Secure Pools
+Secure pools introduced in Windows 10 version 1909 allow kernel callers to have a memory pool that
+cannot be accessed by other kernel components. This kind of protection is internally achieved by the
+Hyper-V hypervisor, leveraging its power to protect memory access even from the kernel, as the memory
+is part of Virtual Trust Level (VTL) 1 (the secure world). Currently, secure pools are not fully documented,
+but here are the basic steps to use a secure pool.
+Secure pools are only available if Virtualization Based Security (VBS) is active (meaning Hyper-
+V exists and creates the two worlds - normal and secure). Discussion of VBS is beyond the scope
+of this book. Consult information online (or the Windows Internals books) for more on VBS.
+A secure pool can be created with ExCreatePool, returning a handle to the pool:
+#define POOL_CREATE_FLG_SECURE_POOL
+0x1
+#define POOL_CREATE_FLG_USE_GLOBAL_POOL 0x2
+#define POOL_CREATE_FLG_VALID_FLAGS (POOL_CREATE_FLG_SECURE_POOL | \
+POOL_CREATE_FLG_USE_GLOBAL_POOL)
+NTSTATUS ExCreatePool (
+_In_ ULONG Flags,
+_In_ ULONG_PTR Tag,
+_In_opt_ POOL_CREATE_EXTENDED_PARAMS* Params,
+_Out_ HANDLE* PoolHandle);
+Currently, flags should be POOL_CREATE_FLG_VALID_FLAGS (both supported flags), and Params
+should be NULL. PoolHandle contains the pool handle if the call succeeds.
+Allocating from a secure pool must be done with ExAllocatePool3, described in the previous section
+with a POOL_EXTENDED_PARAMS_SECURE_POOL structure as a parameter:
+
+===== [PDF page 236] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+230
+#define SECURE_POOL_FLAGS_NONE
+0x0
+#define SECURE_POOL_FLAGS_FREEABLE
+0x1
+#define SECURE_POOL_FLAGS_MODIFIABLE 0x2
+typedef struct _POOL_EXTENDED_PARAMS_SECURE_POOL {
+HANDLE SecurePoolHandle;
+// pool handle
+PVOID Buffer;
+// initial data
+ULONG_PTR Cookie;
+// for validation
+ULONG SecurePoolFlags;
+// flags above
+} POOL_EXTENDED_PARAMS_SECURE_POOL;
+Buffer points to existing data to be initially stored in the new allocation. Cookie is used for validation,
+by calling ExSecurePoolValidate. Freeing memory from a secure pool must be done with a new
+function, ExFreePool2:
+VOID ExFreePool2 (
+_Pre_notnull_ PVOID P,
+_In_ ULONG Tag,
+_In_reads_opt_(ExtendedParametersCount)
+PCPOOL_EXTENDED_PARAMETER ExtendedParameters,
+_In_ ULONG ExtendedParametersCount);
+If ExtendedParameters is NULL (and ExtendedParametersCount is zero), the call is diverted to
+the normal ExFreePool, which will fail for a secure pool. For a secure pool, a single POOL_EXTENDED_-
+PARAMETER is required that has the pool parameters with the pool handle onlt. Buffer should be NULL.
+Finally, a secure pool must be destroyed with ExDestroyPool:
+VOID ExDestroyPool (_In_ HANDLE PoolHandle);
+Overloading the new and delete Operators
+We know there is no C++ runtime in the kernel, which means some C++ features that work as expected in
+user mode don’t work in kernel mode. One of these features are the new and delete C++ operators.
+Although we can use the dynamic memory allocation functions, new and delete have a couple of
+advantages over calling the raw functions:
+• new causes a constructor to be invoked, and delete causes the destructor to be invoked.
+• new accepts a type for which memory must be allocated, rather than specifying a number of bytes.
+Fortunately, C++ allows overloading the new and delete operators, either globally or for secific types.
+new can be overloaded with extra parameters that are needed for kernel allocations - at least the pool type
+must be specified. The first argument to any overloaded new is the number of bytes to allocate, and any
+extra parameters can be added after that. These are specified with paranthesis when actually used. The
+compiler inserts a call to the appropriate constructor, if exists.
+Here is a basic implementation of an overloaded new operator that calls ExAllocatePoolWithTag:
+
+===== [PDF page 237] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+231
+void* __cdecl operator new(size_t size, POOL_TYPE pool, ULONG tag) {
+return ExAllocatePoolWithTag(pool, size, tag);
+}
+The __cdecl modifier indicates this should be using the C calling convention (rather than the __stdcall
+convention). It only matters in x86 builds, but still should be specified as shown.
+Here is an example usage, assuming an object of type MyData needs to be allocated from paged pool:
+MyData* data = new (PagedPool, DRIVER_TAG) MyData;
+if(data == nullptr)
+return STATUS_INSUFFICIENT_RESOURCES;
+// do work with data
+The size parameter is never specified explicitly as the compiler inserts the correct size (which is essentially
+sizeof(MyData) in the above example). All other parameters must be specified. We can make the
+overload simpler to use if we default the tag to a macro such as DRIVER_TAG, expected to exist:
+void* __cdecl operator new(size_t size, POOL_TYPE pool,
+ULONG tag = DRIVER_TAG) {
+return ExAllocatePoolWithTag(pool, size, tag);
+}
+And the corresponding usage is simpler:
+MyData* data = new (PagedPool) MyData;
+In the above examples, the default constructor is invoked, but it’s perfectly valid to invoke any other
+constructor that exists for the type. For example:
+struct MyData {
+MyData(ULONG someValue);
+// details not shown
+};
+auto data = new (PagedPool) MyData(200);
+We can easily extend the overloading idea to other overloads, such as one that wraps ExAllocatePool-
+WithTagPriority:
+
+===== [PDF page 238] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+232
+void* __cdecl operator new(size_t size, POOL_TYPE pool,
+EX_POOL_PRIORITY priority, ULONG tag = DRIVER_TAG) {
+return ExAllocatePoolWithTagPriority(pool, size, tag, priority);
+}
+Using the above operator is just a matter of adding a priority in parenthesis:
+auto data = new (PagedPool, LowPoolPriority) MyData(200);
+Another common case is where you already have an allocated block of memory to store some object
+(perhaps allocated by a function out of your control), but you still want to initialize the object by invoking
+a constructor. Another new overload can be used for this purpose, known as placement new, since it does
+not allocate anything, but the compiler still adds a call to a constructor. Here is how to define a placement
+new operator overload:
+void* __cdecl operator new(size_t size, void* p) {
+return p;
+}
+And an example usage:
+void* SomeFunctionAllocatingObject();
+MyData* data = (MyData*)SomeFunctionAllocatingObject();
+new (data) MyData;
+Finally, an overload for delete is required so the memory can be freed at some point, calling the destructor
+if it exists. Here is how to overload the delete operator:
+void __cdecl operator delete(void* p, size_t) {
+ExFreePool(p);
+}
+The extra size parameter is not used in practice (zero is always the value provided), but the compiler
+requires it.
+
+===== [PDF page 239] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+233
+Remember that you cannot have global objects that have default constructors that do some-
+thing, since there is no runtime to invoke them. The compiler will report a warning if you
+try. A way around it (of sorts) is to declare the global variable as a pointer, and then use an
+overloaded new to allocate and invoke a constructor in DriverEntry. of course, you must
+remember to call delete in the driver’s unload routine.
+Another variant of the delete operator the compiler might insist on if you set the compiler
+conformance to C++17 or newer is the following:
+void __cdecl operator delete(void* p, size_t, std::align_val_t) {
+ExFreePool(p);
+}
+You can look up the meaning of std::align_val_t in a C++ reference, but it does not matter
+for our purposes.
+Lookaside Lists
+The dynamic memory allocation functions discussed so far (the ExAllocatePool* family of APIs) are
+generic in nature, and can accommodate allocations of any size. Internally, managing the pool is non-trivial:
+various lists are needed to manage allocations and deallocations of different sizes. This management aspect
+of the pools is not free.
+One fairly common case that leaves room for optimizations is when fixed-sized allocations are needed.
+When such allocation is freed, it’s possible to not really free it, but just mark it as available. The next
+allocation request can be satisfied by the existing block, which is much faster to do than allocating a fresh
+block. This is exactly the purpose of lookaside lists.
+There are two APIs to use for working with lookaside lists. The original one, available from Windows 2000,
+and a newer available from Vista. I’ll describe both, as they are quite similar.
+The “Classic” Lookaside API
+The first thing to do is to initialize the data structure manageing a lookaside list. Two functions are vailable,
+which are essentailly the same, selcting the paged pool or non-paged pool where the allocations should be
+coming from. Here is the paged pool version:
+VOID ExInitializePagedLookasideList (
+_Out_ PPAGED_LOOKASIDE_LIST Lookaside,
+_In_opt_ PALLOCATE_FUNCTION Allocate,
+_In_opt_ PFREE_FUNCTION Free,
+_In_ ULONG Flags,
+_In_ SIZE_T Size,
+_In_ ULONG Tag,
+_In_ USHORT Depth);
+
+===== [PDF page 240] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+234
+The non-paged variant is practically the same, with the function name being ExInitializeNPaged-
+LookasideList.
+The first parameter is the resulting initialized structure. Although, the structure layout is described in
+wdm.h (with a macro named GENERAL_LOOKASIDE_LAYOUT to accommodate multiple uses that can’t
+be shared in other ways using the C language), you should treat this structure as opaque.
+The Allocate parameter is an optional allocation function that is called by the lookaside implementation
+when a new allocation is required. If specified, the allocation function must have the following prototype:
+PVOID AllocationFunction (
+_In_ POOL_TYPE PoolType,
+_In_ SIZE_T NumberOfBytes,
+_In_ ULONG Tag);
+The allocation function receives the same parameters as ExAllocatePoolWithTag. In fact, if the
+allocation function is not specified, this is the call made by the lookaside list manager. If you don’t
+require any other code, just specify NULL. A custom allocation function could be useful for debugging
+purposes, for example. Another possibility is to call ExAllocatePoolWithTagPriority instead of
+ExAllocatePoolWithTag, if that makes sense for your driver.
+If you do provide an allocation function, you might need to provide a de-allocation function in the Free
+parameter. If not specified, the lookaside list manager calls ExFreePool. Here is the expected prototype
+for this function:
+VOID FreeFunction (
+_In_ __drv_freesMem(Mem) PVOID Buffer);
+The next parameter, Flags can be zero or POOL_RAISE_IF_ALLOCATION_FAILURE (Windows 8 and
+later) that indicates an exception should be raised (STATUS_INSUFFICIENT_RESOURCE) if an allocation
+fails, instead of returning NULL to the caller.
+The Size parameter is the size of chunks managed by the lookaside list. Usually, you would specify it as
+sizeof some structure you want to manage. Tag is the tag to use for allocations. Finally, the last parameter,
+Depth, indicates the number of allocations to keep in a cache. The documentation indicates this parameter
+is “reserved” and should be zero, which makes the lookaside list manager to choose something appropriate.
+Regardless of the number, the “depth” is adjusted based on the allocation patterns used with the lookaside
+list.
+Once a lookaside list is initialized, you can request a memory block (of the size specified in the initialization
+function, of course) by calling ExAllocateFromPagedLookasideList:
+PVOID ExAllocateFromPagedLookasideList (
+_Inout_ PPAGED_LOOKASIDE_LIST Lookaside)
+Nothing could be simpler - no special parameters are required, since everything else is already known. The
+corresponding function for a non-paged pool lookaside list is ExAllocateFromNPagedLookasideList.
+The opposite function used to free an allocation (or return it to the cache) is ExFreeToPaged-
+LookasideList:
+
+===== [PDF page 241] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+235
+VOID ExFreeToPagedLookasideList (
+_Inout_ PPAGED_LOOKASIDE_LIST Lookaside,
+_In_ __drv_freesMem(Mem) PVOID Entry)
+The only value required is the pointer to free (or return to the cache). As you probably guess, the non-paged
+pool variant is ExFreeToNPagedLookasideList.
+Finally, when the lookaside list is no longer needed, it must be freed by calling ExDeletePaged-
+LookasideList:
+VOID ExDeletePagedLookasideList (
+_Inout_ PPAGED_LOOKASIDE_LIST Lookaside);
+One nice benefit of lookaside lists is that you don’t have to return all allocations to the list by repeatedly
+calling ExFreeToPagedLookasideList before calling ExDeletePagedLookasideList; the latter
+is enough, and will free all allocated blocks automatically. ExDeleteNPagedLookasideList is the
+corresponding non-paged variant.
+Write a C++ class wrapper for lookaside lists using the above APIs.
+The Newer Lookaside API
+The newer API provides two main benefits over the classic API:
+• Uniform API for paged and non-paged blocks.
+• The lookaside list structure itself is passed to the custom allocate and free functions (if provided),
+that allows accessing driver data (example shown later).
+Initializing a lookaside list is accomplished with ExInitializeLookasideListEx:
+NTSTATUS ExInitializeLookasideListEx (
+_Out_ PLOOKASIDE_LIST_EX Lookaside,
+_In_opt_ PALLOCATE_FUNCTION_EX Allocate,
+_In_opt_ PFREE_FUNCTION_EX Free,
+_In_ POOL_TYPE PoolType,
+_In_ ULONG Flags,
+_In_ SIZE_T Size,
+_In_ ULONG Tag,
+_In_ USHORT Depth);
+PLOOKASIDE_LIST_EX is the opaque data structure to initialize, which must be allocated from non-paged
+memory, regardless of whether the lookaside list is to manage paged or non-paged memory.
+The allocation and free functions are optional, just as they are with the classic API. These are their
+prototypes:
+
+===== [PDF page 242] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+236
+PVOID AllocationFunction (
+_In_ POOL_TYPE PoolType,
+_In_ SIZE_T NumberOfBytes,
+_In_ ULONG Tag,
+_Inout_ PLOOKASIDE_LIST_EX Lookaside);
+VOID FreeFunction (
+_In_ __drv_freesMem(Mem) PVOID Buffer,
+_Inout_ PLOOKASIDE_LIST_EX Lookaside);
+Notice the lookaside list itself is a parameter. This could be used to access driver data that is part of a larger
+structure containing the lookaside list. For example, suppose the driver has the following structure:
+struct MyData {
+ULONG SomeData;
+LIST_ENTRY SomeHead;
+LOOKASIDELIST_EX Lookaside;
+};
+The driver creates an instance of that structure (maybe globally, or on a per-client basis). Let’s assume it’s
+created dynamically for every client creating a file object to talk to a device the driver manages:
+// if new is overriden as described eariler in this chapter
+MyData* pData = new (NonPagedPool) MyData;
+// or with a standard allocation call
+MyData* pData = (MyData*)ExAllocatePoolWithTag(NonPagedPool,
+sizeof(MyData), DRIVER_TAG);
+// initilaize the lookaside list
+ExInitializeLookasideListEx(&pData->Lookaside, MyAlloc, MyFree, ...);
+In the allocation and free functions, we can get a pointer to our MyData object that contains whatever
+lookaside list is being used at the time:
+PVOID MyAlloc(POOL_TYPE type, SIZE_T size, ULONG tag,
+PLOOKASIDE_LIST_EX lookaside) {
+MyData* data = CONTAINING_RECORD(lookaside, MyData, Lookaside);
+// access members
+//...
+}
+The usefulness of this technique is if you have multiple lookaside lists, each having their own “context”
+data. Obviously, if you just have one such list stored globally, you can just access whatever global variables
+you need.
+
+===== [PDF page 243] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+237
+Continuing with ExInitializeLookasideListEx - PoolType is the pool type to use; this is where the
+driver selects where allocations should be allocated from. Size, Tag and Depth have the same meaning as
+they do in the classic API.
+The Flags parameter can be zero, or one of the following:
+• EX_LOOKASIDE_LIST_EX_FLAGS_RAISE_ON_FAIL - raise an exception instead of returning
+NULL to the caller in case of an allocation failure.
+• EX_LOOKASIDE_LIST_EX_FLAGS_FAIL_NO_RAISE - this flag can only be specified if a custom
+allocation routine is specified, which causes the pool type provided to the allocation function to
+be ORed with the POOL_QUOTA_FAIL_INSTEAD_OF_RAISE flag that causes a call to ExAl-
+locationPoolWithQuotaTag to return NULL on quota limit violation instead of raising the
+POOL_QUOTA_FAIL_INSTEAD_OF_RAISE exception. See the docs for more details.
+The above flags are mutually exclusive.
+Once the lookaside list is initialized, allocation and deallocation are done with the following APIs:
+PVOID ExAllocateFromLookasideListEx (_Inout_ PLOOKASIDE_LIST_EX Lookaside);
+VOID ExFreeToLookasideListEx (
+_Inout_ PLOOKASIDE_LIST_EX Lookaside,
+_In_ __drv_freesMem(Entry) PVOID Entry);
+Of course, the terms “allocation” and “deallocation” are in the context of a lookaside list, meaning
+allocations could be reused, and deallocations might return the block to the cache.
+Finally, a lookaside list must be deleted with ExDeleteLookasideListEx:
+VOID ExDeleteLookasideListEx (_Inout_ PLOOKASIDE_LIST_EX Lookaside);
+Calling Other Drivers
+One way to talk to other drivers is to be a “proper” client by calling ZwOpenFile or ZwCreateFile
+in a similar manner to what a user-mode client does. Kernel callers have other options not available for
+user-mode callers. One of the options is creating IRPs and sending them to a device object directly for
+processing.
+In most cases IRPs are created by one of the three managers, part of the Executive: I/O manager, Plug &
+Play manager, and Power manager. In the cases we’ve seen so far, the I/O manager is the one creating
+IRPs for create, close, read, write, and device I/O control request types. Drivers can create IRPs as well,
+initialize them and then send them directly to another driver for processing. This could be more efficient
+than opening a handle to the desired device, and then making calls using ZwReadFile, ZwWriteFile
+
+===== [PDF page 244] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+238
+and similar APIs we’ll look at in more detail in a later chapter. In some cases, opening a handle to a device
+might not even be an option, but obtaining a device object pointer might still be possible.
+The kernel provides a generic API for building IRPs, starting with IoAllocateIrp. Using this API
+requires the driver to register a completion routine so the IRP can be porperly freed. We’ll examine these
+techniques in a later chapter (“Advanced Programming Techniques (Part 2)”). In this section, I’ll introduce
+a simpler function to build a device I/O control IRP using IoBuildDeviceIoControlRequest:
+PIRP IoBuildDeviceIoControlRequest(
+_In_
+ULONG IoControlCode,
+_In_
+PDEVICE_OBJECT DeviceObject,
+_In_opt_
+PVOID InputBuffer,
+_In_
+ULONG InputBufferLength,
+_Out_opt_ PVOID OutputBuffer,
+_In_
+ULONG OutputBufferLength,
+_In_
+BOOLEAN InternalDeviceIoControl,
+_In_opt_
+PKEVENT Event,
+_Out_
+PIO_STATUS_BLOCK IoStatusBlock);
+The API returns a proper IRP pointer on success, including filling in the first IO_STACK_LOCATION, or
+NULL on failure. Some of the parameters to IoBuildDeviceIoControlRequest are the same provided
+to the DeviceIoControl user-mode API (or to its kernel equivalent, ZwDeviceIoControlFile) -
+IoControlCode, InputBuffer, InputBufferLength, OutputBuffer and OutputBufferLength.
+The other parameters are the following:
+• DeviceObject is the target device of this request. It’s needed so the API can allocate the correct
+number of IO_STACK_LOCATION structures that accompany any IRP.
+• InternalDeviceControl indicates whether the IRP should set its major function to IRP_MJ_INTER-
+NAL_DEVICE_CONTROL (TRUE) or IRP_MJ_DEVICE_CONTROL (FALSE). This obviously depends
+on the target device’s expectations.
+• Event is an optional pointer to an event object that gets signaled when the IRP is completed by the
+target device (or some other device the target may send the IRP to). An event is needed if the IRP
+is sent for synchronous processing, so that the caller can wait on the event if the operation has not
+yet completed. We’ll see a complete example in the next section.
+• IoStatusBlock returns the final status of the IRP (status and information), so the caller can examine
+it if it so wishes.
+The call to IoBuildDeviceIoControlRequest just builds the IRP - it is not sent anywhere at this
+point. To actually send the IRP to a device, call the generic IoCallDriver API:
+NTSTATUS IoCallDriver(
+_In_ PDEVICE_OBJECT DeviceObject,
+_Inout_ PIRP Irp);
+IoCallDriver advances the current I/O stack location to the next, and then invokes the target driver’s
+major function dispatch routine. It returns whatever is returned from that dispatch routine. Here is a very
+simplified implementation:
+
+===== [PDF page 245] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+239
+NTSTATUS IoCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp {
+// update the current layer index
+DeviceObject->CurrentLocation--;
+auto irpSp = IoGetNextIrpStackLocation(Irp);
+// make the next stack location the current one
+Irp->Tail.Overlay.CurrentStackLocation = irpSp;
+// update device object
+irpSp->DeviceObject = DeviceObject;
+return (DeviceObject->DriverObject->MajorFunction[irpSp->MajorFunction])
+(DeviceObject, Irp);
+}
+The main question remaining is how to we get a pointer to a device object in the first place? One way is
+by calling IoGetDeviceObjectPointer:
+NTSTATUS IoGetDeviceObjectPointer(
+_In_
+PUNICODE_STRING ObjectName,
+_In_
+ACCESS_MASK DesiredAccess,
+_Out_ PFILE_OBJECT *FileObject,
+_Out_ PDEVICE_OBJECT *DeviceObject);
+The ObjectName parameter is the fully-qualified name of the device object in the Object Manager’s
+namespace (as can be viewed with the WinObj tool from Sysinternals). Desired access is usually
+FILE_READ_DATA, FILE_WRITE_DATA or FILE_ALL_ACCESS. Two values are returned on success: the
+device object pointer (in DeviceObject) and an open file object pointing to the device object (in FileObject).
+The file object is not usually needed, but it should be kept around as a means of keeping the device object
+referenced. When you’re done with the device object, call ObDereferenceObject on the file object
+pointer to decrement the device object’s reference count indirectly. Alternatively, you can increment the
+device object’s reference count (ObReferenceObject) and then decrement the file object’s reference
+count so you don’t have to keep it around.
+The next section demostrates usage of these APIs.
+Putting it All Together: The Melody Driver
+The Melody driver we’ll build in this section demonstrates many of the techniques shown in this chapter.
+The melody driver allows playing sounds asynchronously (contrary to the Beep user-mode API that plays
+sounds synchronously). A client application calls DeviceIoControl with a bunch of notes to play, and
+the driver will play them as requested without blocking. Another sequence of notes can then be sent to
+the driver, those notes queued to be played after the first sequence is finished.
+
+===== [PDF page 246] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+240
+It’s possible to come up with a user-mode solution that would do essentially the same thing, but this can
+only be easily done in the context of a single process. A driver, on the other hand, can accept calls from
+multiple processes, having a “global” ordering of playback. In any case, the point is to demonstrate driver
+programming techniques, rather than managing a sound playing scenario.
+We’ll start by creating an empty WDM driver, as we’ve done in previous chapters, named KMelody. Then
+we’ll add a file named MelodyPublic.h to serve as the common data to the driver and a user-mode client.
+This is where we define what a note looks like and an I/O control code for communication:
+// MelodyPublic.h
+#pragma once
+#define MELODY_SYMLINK L"\\??\\KMelody"
+struct Note {
+ULONG Frequency;
+ULONG Duration;
+ULONG Delay{ 0 };
+ULONG Repeat{ 1 };
+};
+#define MELODY_DEVICE 0x8003
+#define IOCTL_MELODY_PLAY \
+CTL_CODE(MELODY_DEVICE, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+A note consists of a frequency (in Hertz) and duration to play. To make it a bit more interesting, a delay
+and repeat count are added. If Repeat is greater than one, the sound is played Repeat times, with a delay
+of Delay between repeats. Duration and Delay are provided in milliseconds.
+The architecture we’ll go for in the driver is to have a thread created when the first client opens a handle
+to our device, and that thread will perform the playback based on a queue of notes the driver manages.
+The thread will be shut down when the driver unloads.
+It may seem asymmetric at this point - why not create the thread when the driver loads? As we shall
+see shortly, there is a little “snag” that we have to deal with that prevents creating the thread when the
+driver loads.
+Let’s start with DriverEntry. It needs to create a device object and a symbolic link. Here is the full
+function:
+
+===== [PDF page 247] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+241
+PlaybackState* g_State;
+extern "C" NTSTATUS
+DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+UNREFERENCED_PARAMETER(RegistryPath);
+g_State = new (PagedPool) PlaybackState;
+if (g_State == nullptr)
+return STATUS_INSUFFICIENT_RESOURCES;
+auto status = STATUS_SUCCESS;
+PDEVICE_OBJECT DeviceObject = nullptr;
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\KMelody");
+do {
+UNICODE_STRING name = RTL_CONSTANT_STRING(L"\\Device\\KMelody");
+status = IoCreateDevice(DriverObject, 0, &name, FILE_DEVICE_UNKNOWN,
+0, FALSE, &DeviceObject);
+if (!NT_SUCCESS(status))
+break;
+status = IoCreateSymbolicLink(&symLink, &name);
+if (!NT_SUCCESS(status))
+break;
+} while (false);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "Error (0x%08X)\n", status));
+delete g_State;
+if (DeviceObject)
+IoDeleteDevice(DeviceObject);
+return status;
+}
+DriverObject->DriverUnload = MelodyUnload;
+DriverObject->MajorFunction[IRP_MJ_CREATE] =
+DriverObject->MajorFunction[IRP_MJ_CLOSE] = MelodyCreateClose;
+DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = MelodyDeviceControl;
+return status;
+}
+Most of the code should be familiar by now. The only new code is the creation of an object of type
+
+===== [PDF page 248] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+242
+PlaybackState. The new C++ operator is overloaded as described earlier in this chapter. If allocating a
+PlaybackState instance fails, DriverEntry returns STATUS_INSUFFICIENT_RESOURCES, report-
+ing a failure to the kernel.
+The PlaybackState class is going to manage the list of notes to play and most other functionality specific
+to the driver. Here is its declaration (in PlaybackState.h):
+struct PlaybackState {
+PlaybackState();
+~PlaybackState();
+NTSTATUS AddNotes(const Note* notes, ULONG count);
+NTSTATUS Start(PVOID IoObject);
+void Stop();
+private:
+static void PlayMelody(PVOID context);
+void PlayMelody();
+LIST_ENTRY m_head;
+FastMutex m_lock;
+PAGED_LOOKASIDE_LIST m_lookaside;
+KSEMAPHORE m_counter;
+KEVENT m_stopEvent;
+HANDLE m_hThread{ nullptr };
+};
+m_head is the head of the linked list holding the notes to play. Since multiple threads can access
+this list, it must be protected with a synchronization object. In this case, we’ll go with a fast mutex.
+FastMutex is a wrapper class similar to the one we saw in chapter 6, with the added twist that it’s
+initialized in its constructor rather than a separate Init method. This is comvenient, and possible, because
+PlaybackState is allocated dynamically, causing its constructor to be invoked, along with constructors
+for data members (if any).
+The note objects will be allocated from a lookaside list (m_lookaside), as each note has a fixed size, and
+there is a strong likelihood of many notes coming and going. m_stopEvent is an event object that will
+be used as a way to signal our playback thread to terminate. m_hThread is the playback thread handle.
+Finally, m_counter is a sempahore that is going to be used in a somewhat counter-intuitive way, its
+internal count indicating the number of notes in the queue.
+As you can see, the event and semaphore don’t have wrapper classes, so we need to initialize them in the
+PlaybackState constructor. Here is the constructor in full (in PlaybackState.cpp) with an addition of a
+type that is going to hold a single node:
+
+===== [PDF page 249] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+243
+struct FullNote : Note {
+LIST_ENTRY Link;
+};
+PlaybackState::PlaybackState() {
+InitializeListHead(&m_head);
+KeInitializeSemaphore(&m_counter, 0, 1000);
+KeInitializeEvent(&m_stopEvent, SynchronizationEvent, FALSE);
+ExInitializePagedLookasideList(&m_lookaside, nullptr, nullptr, 0,
+sizeof(FullNote), DRIVER_TAG, 0);
+}
+Here are the initialization steps taken by the constructor:
+• Initialize the linked list to an empty list (InitializeListHead).
+• Initialize the semaphore to a value of zero, meaning no notes are queued up at this point, with a
+maximum of 1000 queued notes. Of course, this number is arbitrary.
+• Initialize the stop event as a SynchronizationEvent type in the non-signaled state (KeInitializeEvent).
+Technically, a NotificationEvent would have worked just as well, as just one thread will be
+waiting on this event as we’ll see later.
+• Initialize the lookaside list to managed paged pool allocations with size of sizeof(FullNote).
+FullNote extends Note to include a LIST_ENTRY member, otherwise we can’t store such objects
+in a linked list. The FullNote type should not be visible to user-mode, which is why it’s defined
+provately in the driver’s source files only.
+DRIVER_TAG and DRIVER_PREFIX are defined in the file KMelody.h.
+Before the driver finally unloads, the PlaybackState object is going to be destroyed, invoking its
+destructor:
+PlaybackState::~PlaybackState() {
+Stop();
+ExDeletePagedLookasideList(&m_lookaside);
+}
+The call to Stop signals the playback thread to terminate as we’ll see shortly. The only other thing left to
+do in terms of cleanup is to free the lookaside list.
+The unload routine for the driver is similar to ones we’ve seen before with the addition of freeing the
+PlaybackState object:
+
+===== [PDF page 250] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+244
+void MelodyUnload(PDRIVER_OBJECT DriverObject) {
+delete g_State;
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\KMelody");
+IoDeleteSymbolicLink(&symLink);
+IoDeleteDevice(DriverObject->DeviceObject);
+}
+The IRP_MJ_DEVICE_CONTROL handler is where notes provided by a client need to be added to the queue
+of notes to play. The implementation is pretty straightforward because the heavy lifting is performed by
+the PlaybackState::AddNotes method. Here is MelodyDeviceControl that validates the client’s
+data and then invokes AddNotes:
+NTSTATUS MelodyDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
+auto irpSp = IoGetCurrentIrpStackLocation(Irp);
+auto& dic = irpSp->Parameters.DeviceIoControl;
+auto status = STATUS_INVALID_DEVICE_REQUEST;
+ULONG info = 0;
+switch (dic.IoControlCode) {
+case IOCTL_MELODY_PLAY:
+if (dic.InputBufferLength == 0 ||
+dic.InputBufferLength % sizeof(Note) != 0) {
+status = STATUS_INVALID_BUFFER_SIZE;
+break;
+}
+auto data = (Note*)Irp->AssociatedIrp.SystemBuffer;
+if (data == nullptr) {
+status = STATUS_INVALID_PARAMETER;
+break;
+}
+status = g_State->AddNotes(data,
+dic.InputBufferLength / sizeof(Note));
+if (!NT_SUCCESS(status))
+break;
+info = dic.InputBufferLength;
+break;
+}
+return CompleteRequest(Irp, status, info);
+}
+CompleteRequest is a helper that we’ve seen before that completes the IRP with the given status and
+information:
+
+===== [PDF page 251] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+245
+NTSTATUS CompleteRequest(PIRP Irp,
+NTSTATUS status = STATUS_SUCCESS, ULONG_PTR info = 0);
+//...
+NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status, ULONG_PTR info) {
+Irp->IoStatus.Status = status;
+Irp->IoStatus.Information = info;
+IoCompleteRequest(Irp, IO_NO_INCREMENT);
+return status;
+}
+PlaybackState::AddNotes needs to iterate over the provided notes. Here is the beginning of the
+function:
+NTSTATUS PlaybackState::AddNotes(const Note* notes, ULONG count) {
+KdPrint((DRIVER_PREFIX "State::AddNotes %u\n", count));
+for (ULONG i = 0; i < count; i++) {
+For each note, it needs to allocate a FullNote structure from the lookaside list:
+auto fullNote = (FullNote*)ExAllocateFromPagedLookasideList(&m_lookaside);
+if (fullNote == nullptr)
+return STATUS_INSUFFICIENT_RESOURCES;
+If succesful, the note data is copied to the FullNote and is added to the linked list under the protection
+of the fast mutex:
+//
+// copy the data from the Note structure
+//
+memcpy(fullNote, &notes[i], sizeof(Note));
+//
+// insert into the linked list
+//
+Locker locker(m_lock);
+InsertTailList(&m_head, &fullNote->Link);
+}
+Locker<T> is the same type we looked at in chapter 6. The notes are inserted at the back of the list
+with InsertTailList. This is where we must provide a pointer to a LIST_ENTRY object, which is why
+FullNote objects are used instead of just Note. Finally, when the loop is completed, the semaphore must
+be incremented by the number of notes to indicate there are more count more notes to play:
+
+===== [PDF page 252] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+246
+//
+// make the semaphore signaled (if it wasn't already) to
+// indicate there are new note(s) to play
+//
+KeReleaseSemaphore(&m_counter, 2, count, FALSE);
+KdPrint((DRIVER_PREFIX "Semaphore count: %u\n",
+KeReadStateSemaphore(&m_counter)));
+The value 2 used in KeReleaseSemaphore is the temporary priority boost a driver can provide to a
+thread that is released because of the semaphore becoming signaled (the same thing happens with the
+second parameter to IoCompleteRequest). I’ve chosen the value 2 arbitrarily. The value 0 (IO_NO_-
+INCREMENT) is fine as well.
+For debugging purposes, it may be useful to read the semaphore’s count with KeReadStateSemaphore
+as was done in the above code. Here is the full function (without the comments):
+NTSTATUS PlaybackState::AddNotes(const Note* notes, ULONG count) {
+KdPrint((DRIVER_PREFIX "State::AddNotes %u\n", count));
+for (ULONG i = 0; i < count; i++) {
+auto fullNote =
+(FullNote*)ExAllocateFromPagedLookasideList(&m_lookaside);
+if (fullNote == nullptr)
+return STATUS_INSUFFICIENT_RESOURCES;
+memcpy(fullNote, &notes[i], sizeof(Note));
+Locker locker(m_lock);
+InsertTailList(&m_head, &fullNote->Link);
+}
+KeReleaseSemaphore(&m_counter, 2, count, FALSE);
+KdPrint((DRIVER_PREFIX "Semaphore count: %u\n",
+KeReadStateSemaphore(&m_counter)));
+return STATUS_SUCCESS;
+}
+The next part to look at is handling IRP_MJ_CREATE and IRP_MJ_CLOSE. In earlier chapters, we just
+completed these IRPs successfully and that was it. This time, we need to create the playback thread when
+the first client opens a handle to our device. The initialization in DriverEntry points both indices to
+the same function, but the code is slightly different between the two. We could separate them to different
+functions, but if the difference is not great we might decide to handle both within the same function.
+For IRP_MJ_CLOSE, there is nothing to do but complete the IRP successfuly. For IRP_MJ_CREATE, we
+want to start the playback thread the first time the dispatch routine is invoked. Here is the code:
+
+===== [PDF page 253] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+247
+NTSTATUS MelodyCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+auto status = STATUS_SUCCESS;
+if (IoGetCurrentIrpStackLocation(Irp)->MajorFunction == IRP_MJ_CREATE) {
+//
+// create the "playback" thread (if needed)
+//
+status = g_State->Start(DeviceObject);
+}
+return CompleteRequest(Irp, status);
+}
+The I/O stack location contains the IRP major function code we can use to make the distinction as required
+here. In the Create case, we call PlaybackState::Start with the device object pointer that would be
+used to keep the driver object alive as long as the thread is running. Let’s see what that method looks like.
+NTSTATUS PlaybackState::Start(PVOID IoObject) {
+Locker locker(m_lock);
+if (m_hThread)
+return STATUS_SUCCESS;
+return IoCreateSystemThread(
+IoObject,
+// Driver or device object
+&m_hThread,
+// resulting handle
+THREAD_ALL_ACCESS,
+// access mask
+nullptr,
+// no object attributes required
+NtCurrentProcess(),
+// create in the current process
+nullptr,
+// returned client ID
+PlayMelody,
+// thread function
+this);
+// passed to thread function
+}
+Acuqiring the fast mutex ensures that a second thread is not created (as m_hThread would already be non-
+NULL). The thread is created with IoCreateSystemThread, which is preferred over PsCreateSys-
+temThread because it ensures that the driver is not unloaded while the thread is executing (this does
+require Windows 8 or later).
+The passed-in I/O object is the device object provided by the IRP_MJ_CREATE handler. The most common
+way of creating a thread by a driver is to run it in the context of the System process, as it normally should
+not be tied to a user-mode process. Our case, however, is more complicated because we intend to use the
+Beep driver to play the notes. The Beep driver needs to be able to handle multiple users (that might be
+connected to the same system), each one playing their own sounds. This is why when asked to play a note,
+the Beep driver plays in the context of the caller’s session. If we create the thread in the System process,
+which is always part of session zero, we will not hear any sound, because session 0 is not an interactive
+user session.
+
+===== [PDF page 254] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+248
+This means we need to create our thread in the context of some process running under the caller’s session
+- Using the caller’s process directly (NtCurrentProcess) is the simplest way to get it working. You may
+frown at this, and rightly so, because the first process calling the driver to play something is going to have
+to host that thread for the lifetime of the driver. This has an unintended side effect: the process will not die.
+Even if it may seem to terminate, it will still show up in Task Manager with our thread being the single
+thread still keeping the process alive. We’ll find a more elegant solution later in this chapter.
+Yet another consequence of this arrangement is that we only handle one session - the first one where one
+of its processes happens to call the driver. We’ll fix that as well later on.
+The thread created starts runniing the PlayMelody function - a static function in the PlaybackState
+class. Callbacks must be global or static functions (because they are directly C function pointers), but in
+this case we would like to access the members of this instance of PlaybackState. The common trick
+is to pass the this pointer as the thread argument, and the callback simply invokes an instance method
+using this pointer:
+// static function
+void PlaybackState::PlayMelody(PVOID context) {
+((PlaybackState*)context)->PlayMelody();
+}
+Now the instance method PlaybackState::PlayMelody has full access to the object’s members.
+There is another way to invoke the instance method without going through the intermediate
+static by using C++ lambda functions, as non-capturing lambdas are directly convertible to C
+function pointers:
+IoCreateSystemThread(..., [](auto param) {
+((PlaybackState*)param)->PlayMelody();
+}, this);
+The first order of business in the new thread is to obtain a pointer to the Beep device using IoGetDe-
+viceObjectPointer:
+#include <ntddbeep.h>
+void PlaybackState::PlayMelody() {
+PDEVICE_OBJECT beepDevice;
+UNICODE_STRING beepDeviceName = RTL_CONSTANT_STRING(DD_BEEP_DEVICE_NAME_U);
+PFILE_OBJECT beepFileObject;
+auto status = IoGetDeviceObjectPointer(&beepDeviceName, GENERIC_WRITE,
+&beepFileObject, &beepDevice);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "Failed to locate beep device (0x%X)\n",
+
+===== [PDF page 255] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+249
+status));
+return;
+}
+The Beep device name is \Device\Beep as we’ve seen in chapter 2. Conveniently, the provided header
+ntddbeep.h declares everything we need in order to work with the device, such as the DD_BEEP_DEVICE_-
+NAME_U macro that defines the Unicode name.
+At this point, the thread should loop around while it has notes to play and has not been instructed to
+terminate. This is where the semaphore and the event come in. The thread must wait until one of them is
+signaled. If it’s the event, it should break out of the loop. If it’s the semaphore, it means the semaphore’s
+count is greater than zero, which in turn means the list of notes is not empty:
+PVOID objects[] = { &m_counter, &m_stopEvent };
+IO_STATUS_BLOCK ioStatus;
+BEEP_SET_PARAMETERS params;
+for (;;) {
+status = KeWaitForMultipleObjects(2, objects, WaitAny, Executive,
+KernelMode, FALSE, nullptr, nullptr);
+if (status == STATUS_WAIT_1) {
+KdPrint((DRIVER_PREFIX "Stop event signaled. Exiting thread...\n"));
+break;
+}
+KdPrint((DRIVER_PREFIX "Semaphore count: %u\n",
+KeReadStateSemaphore(&m_counter)));
+The required call is to KeWaitForMultipleObjects with the event and semaphore. They are put in an
+array, since this is the requirement for KeWaitForMultipleObjects. If the returned status is STATUS_-
+WAIT_1 (which is the same as STATUS_WAIT_0 + 1), meaning index number 1 is the signaled object,
+the loop is exited with a break instruction.
+Now we need to extract the next note to play:
+PLIST_ENTRY link;
+{
+Locker locker(m_lock);
+link = RemoveHeadList(&m_head);
+NT_ASSERT(link != &m_head);
+}
+auto note = CONTAINING_RECORD(link, FullNote, Link);
+KdPrint((DRIVER_PREFIX "Playing note Freq: %u Dur: %u Rep: %u Delay: %u\n",
+note->Frequency, note->Duration, note->Repeat, note->Delay));
+
+===== [PDF page 256] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+250
+We remove the head item from the list, and doing so under the fast mutex’ protection. The assert ensures
+we are in a consistent state - remember that removing an item from an empty list returns the pointer to
+its head.
+The actual FullNote pointer is retrieved with the help of the CONTAINING_RECORD macro, that moves
+the LIST_ENTRY pointer we received from RemoveHeadList to the containing FullNode that we are
+actually interested in.
+The next step is to handle the note. If the note’s frequency is zero, let’s consider that as a “silence time”
+with the length provided by Delay:
+if (note->Frequency == 0) {
+//
+// just do a delay
+//
+NT_ASSERT(note->Duration > 0);
+LARGE_INTEGER interval;
+interval.QuadPart = -10000LL * note->Duration;
+KeDelayExecutionThread(KernelMode, FALSE, &interval);
+}
+KeDelayExecutionThread is the rough equivalent of the Sleep/SleepEx APIs from user-mode. Here
+is its declaration:
+NTSTATUS KeDelayExecutionThread (
+_In_ KPROCESSOR_MODE WaitMode,
+_In_ BOOLEAN Alertable,
+_In_ PLARGE_INTEGER Interval);
+We’ve seen all these parameters as part of the wait functions. The most common invocation is with
+KernelMode and FALSE for WaitMode and Alertable, respectively. The interval is the most important
+parameter, where negative values mean relative wait in 100nsec units. Converting from milliseconds
+means multiplying by -10000, which is what you see in the above code.
+If the frequency in the note is not zero, then we need to call the Beep driver with proper IRP.
+We already know that we need the IOCTL_BEEP_SET control code (defined in ntddbeep.h) and the
+BEEP_SET_PARAMETERS structure. All we need to do is build an IRP with the correct information using
+IoBuildDeviceIoControlRequest, and send it to the beep device with IoCallDriver:
+
+===== [PDF page 257] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+251
+else {
+params.Duration = note->Duration;
+params.Frequency = note->Frequency;
+int count = max(1, note->Repeat);
+KEVENT doneEvent;
+KeInitializeEvent(&doneEvent, NotificationEvent, FALSE);
+for (int i = 0; i < count; i++) {
+auto irp = IoBuildDeviceIoControlRequest(IOCTL_BEEP_SET, beepDevice,
+&params, sizeof(params),
+nullptr, 0, FALSE, &doneEvent, &ioStatus);
+if (!irp) {
+KdPrint((DRIVER_PREFIX "Failed to allocate IRP\n"));
+break;
+}
+status = IoCallDriver(beepDevice, irp);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "Beep device playback error (0x%X)\n",
+status));
+break;
+}
+if (status == STATUS_PENDING) {
+KeWaitForSingleObject(&doneEvent, Executive, KernelMode,
+FALSE, nullptr);
+}
+We loop around based on the Repeat member (which is usually 1). Then the IRP_MJ_DEVICE_CONTROL
+IRP is built with IoBuildDeviceIoControlRequest, supplying the frequency to play and the
+duration. Then, IoCallDriver is invoked with the Beep device pointer we obtained earlier, and
+the IRP. Unfortunately (or futunately, depending on your perspective), the Beep driver just starts the
+operation, but does not wait for it to finish. It might (and in fact, always) returns STATUS_PENDING
+from the IoCallDriver call, which means the operation is not yet complete (the actual playing has
+not yet begun). Since we don’t have anything else to do until then, the doneEvent event provided to
+IoBuildDeviceIoControlRequest is signaled automatically by the I/O manager when the operation
+completes - so we wait on the event.
+Now that the sound is playing, we have to wait for the duration of that note with KeDelayExecution-
+Thread:
+
+===== [PDF page 258] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+252
+LARGE_INTEGER delay;
+delay.QuadPart = -10000LL * note->Duration;
+KeDelayExecutionThread(KernelMode, FALSE, &delay);
+Finally, if Repeat is greater than one, then we might need to wait between plays of the same note:
+// perform the delay if specified,
+// except for the last iteration
+//
+if (i < count - 1 && note->Delay != 0) {
+delay.QuadPart = -10000LL * note->Delay;
+KeDelayExecutionThread(KernelMode, FALSE, &delay);
+}
+}
+}
+At this point, the note data can be freed (or just returned to the lookaside list) and the code loops back to
+wait for the availability of the next note:
+ExFreeToPagedLookasideList(&m_lookaside, note);
+}
+The loop continues until the thread is instructed to stop by signaling stopEvent, at which point it breaks
+from the infinite loop and cleans up by dereferecning the file object obtained from IoGetDeviceOb-
+jectPointer:
+ObDereferenceObject(beepFileObject);
+}
+Here is the entire thread function for convenience (comments and KdPrint removed):
+void PlaybackState::PlayMelody() {
+PDEVICE_OBJECT beepDevice;
+UNICODE_STRING beepDeviceName = RTL_CONSTANT_STRING(DD_BEEP_DEVICE_NAME_U);
+PFILE_OBJECT beepFileObject;
+auto status = IoGetDeviceObjectPointer(&beepDeviceName, GENERIC_WRITE,
+&beepFileObject, &beepDevice);
+if (!NT_SUCCESS(status)) {
+return;
+}
+PVOID objects[] = { &m_counter, &m_stopEvent };
+
+===== [PDF page 259] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+253
+IO_STATUS_BLOCK ioStatus;
+BEEP_SET_PARAMETERS params;
+for (;;) {
+status = KeWaitForMultipleObjects(2, objects, WaitAny, Executive,
+KernelMode, FALSE, nullptr, nullptr);
+if (status == STATUS_WAIT_1) {
+break;
+}
+PLIST_ENTRY link;
+{
+Locker locker(m_lock);
+link = RemoveHeadList(&m_head);
+NT_ASSERT(link != &m_head);
+}
+auto note = CONTAINING_RECORD(link, FullNote, Link);
+if (note->Frequency == 0) {
+NT_ASSERT(note->Duration > 0);
+LARGE_INTEGER interval;
+interval.QuadPart = -10000LL * note->Duration;
+KeDelayExecutionThread(KernelMode, FALSE, &interval);
+}
+else {
+params.Duration = note->Duration;
+params.Frequency = note->Frequency;
+int count = max(1, note->Repeat);
+KEVENT doneEvent;
+KeInitializeEvent(&doneEvent, SynchronizationEvent, FALSE);
+for (int i = 0; i < count; i++) {
+auto irp = IoBuildDeviceIoControlRequest(IOCTL_BEEP_SET,
+beepDevice, &params, sizeof(params),
+nullptr, 0, FALSE, &doneEvent, &ioStatus);
+if (!irp) {
+break;
+}
+NT_ASSERT(irp->UserEvent == &doneEvent);
+status = IoCallDriver(beepDevice, irp);
+if (!NT_SUCCESS(status)) {
+break;
+
+===== [PDF page 260] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+254
+}
+if (status == STATUS_PENDING) {
+KeWaitForSingleObject(&doneEvent, Executive,
+KernelMode, FALSE, nullptr);
+}
+LARGE_INTEGER delay;
+delay.QuadPart = -10000LL * note->Duration;
+KeDelayExecutionThread(KernelMode, FALSE, &delay);
+if (i < count - 1 && note->Delay != 0) {
+delay.QuadPart = -10000LL * note->Delay;
+KeDelayExecutionThread(KernelMode, FALSE, &delay);
+}
+}
+}
+ExFreeToPagedLookasideList(&m_lookaside, note);
+}
+ObDereferenceObject(beepFileObject);
+}
+The last piece of the puzzle is the PlaybackState::Stop method that signals the thread to exit:
+void PlaybackState::Stop() {
+if (m_hThread) {
+//
+// signal the thread to stop
+//
+KeSetEvent(&m_stopEvent, 2, FALSE);
+//
+// wait for the thread to exit
+//
+PVOID thread;
+auto status = ObReferenceObjectByHandle(m_hThread, SYNCHRONIZE,
+*PsThreadType, KernelMode, &thread, nullptr);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "ObReferenceObjectByHandle error (0x%X)\n",
+status));
+}
+else {
+KeWaitForSingleObject(thread, Executive, KernelMode, FALSE, nullptr\
+);
+
+===== [PDF page 261] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+255
+ObDereferenceObject(thread);
+}
+ZwClose(m_hThread);
+m_hThread = nullptr;
+}
+}
+If the thread exists (m_hThread is non-NULL), then we set the event (KeSerEvent). Then we wait for
+the thread to actually terminate. This is technically unnecessary because the thread was created with
+IoCreateSystemThread, so there is no danger the driver is unloaded prematurely. Still, it’s worthwhile
+showing how to get the pointer to the thread object given a handle (since KeWaitForSingleObject
+requires an object). It’s important to remember to call ObDereferenceObject once we don’t need the
+pointer anymore, or the thread object will remain alive forever (keeping its process and other resources
+alive as well).
+Client Code
+Here are some examples for invokign the driver (error handling ommitted):
+#include <Windows.h>
+#include <stdio.h>
+#include "..\KMelody\MelodyPublic.h"
+int main() {
+HANDLE hDevice = CreateFile(MELODY_SYMLINK, GENERIC_WRITE, 0,
+nullptr, OPEN_EXISTING, 0, nullptr);
+Note notes[10];
+for (int i = 0; i < _countof(notes); i++) {
+notes[i].Frequency = 400 + i * 30;
+notes[i].Duration = 500;
+}
+DWORD bytes;
+DeviceIoControl(hDevice, IOCTL_MELODY_PLAY, notes, sizeof(notes),
+nullptr, 0, &bytes, nullptr);
+for (int i = 0; i < _countof(notes); i++) {
+notes[i].Frequency = 1200 - i * 100;
+notes[i].Duration = 300;
+notes[i].Repeat = 2;
+notes[i].Delay = 300;
+}
+DeviceIoControl(hDevice, IOCTL_MELODY_PLAY, notes, sizeof(notes),
+
+===== [PDF page 262] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+256
+nullptr, 0, &bytes, nullptr);
+CloseHandle(hDevice);
+return 0;
+}
+I recommend you build the driver and the client and test them. The project names are KMelody and
+Melody in the solution for this chapter. Build your own music!
+1. Replace the call to IoCreateSystemThread with PsCreateSystemThread and
+make the necessary adjustments.
+2. Replace the lookaside list API with the newer API.
+Invoking System Services
+System Services (system calls) are normally invoked indirectly from user mode code. For example, calling
+the Windows CreateFile API in user mode invokes NtCreateFile from NtDll.Dll, which is a
+system call. This call traverses the user/kernel boundary, eventually calling the “real” NtCreateFile
+implementation within the executive.
+We already know that drivers can invoke system calls as well, using the Nt or the Zw variant (which sets
+the previous execution mode to KernelMode before invoking the system call). Some of these system calls
+are fully documented in the driver kit, such as NtCreateFile/ZwCreateFile. Others, however, are not
+documented or sometimes partially documented.
+For example, enumerating processes in the system is fairly easy to do from user-mode - in fact, there are
+several APIs one can use for this purpose. They all invoke the NtQuerySystemInformation system
+call, which is not officially documented in the WDK. Ironically, it’s provided in the user-mode header
+Winternl.h like so:
+NTSTATUS NtQuerySystemInformation (
+IN SYSTEM_INFORMATION_CLASS SystemInformationClass,
+OUT PVOID SystemInformation,
+IN ULONG SystemInformationLength,
+OUT PULONG ReturnLength OPTIONAL);
+
+===== [PDF page 263] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+257
+The macros IN and OUT expand to nothing. These were used in the old days before SAL was invented to
+provide some semantics for developers. For some reason, Winternl.h uses these macros rather than the
+modern SAL annotations.
+We can copy this definition and tweak it a bit by turning it into its Zw variant, more suitable for kernel
+callers. The SYSTEM_INFORMATION_CLASS enumeration and associated data structures are the real data
+we’re after. Some values are provided in user-mode and/or kernel-mode headers. Most of the values have
+been “reversed engineered” and can be found in open source projects, such as Process Hacker². Although
+these APIs might not be officially documnented, they are unlikely to change as Microsoft’s own tools
+depend on many of them.
+If the API question only exists in certain Windows versions, it’s possible to query dynamically for the
+existence of a kernel API with MmGetSystemRoutineAddress:
+PVOID MmGetSystemRoutineAddress (_In_ PUNICODE_STRING SystemRoutineName);
+You can think of MmGetSystemRoutineAddress as the kernel-mode equivalent of the user-mode
+GetProcAddress API.
+Another very useful API is NtQueryInformationProcess, also defined in Winternl.h:
+NTAPI NtQueryInformationProcess (
+IN HANDLE ProcessHandle,
+IN PROCESSINFOCLASS ProcessInformationClass,
+OUT PVOID ProcessInformation,
+IN ULONG ProcessInformationLength,
+OUT PULONG ReturnLength OPTIONAL);
+Curiously enough, the kernel-mode headers provide many of the PROCESSINFOCLASS enumeration
+values, along with their associated data structures, but not the definition of this system call itself. Here is
+a partial set of values for PROCESSINFOCLASS:
+²https://github.com/processhacker/phnt
+
+===== [PDF page 264] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+258
+typedef enum _PROCESSINFOCLASS {
+ProcessBasicInformation = 0,
+ProcessDebugPort = 7,
+ProcessWow64Information = 26,
+ProcessImageFileName = 27,
+ProcessBreakOnTermination = 29
+} PROCESSINFOCLASS;
+A more complete list is available in ntddk.h. A full list is available within the Process Hacker
+project.
+The following example shows how to query the current process image file name. ProcessImageFile-
+Name seems to be the way to go, and it expects a UNICODE_STRING as the buffer:
+ULONG size = 1024;
+auto buffer = ExAllocatePoolWithTag(PagedPool, size, DRIVER_TAG);
+auto status = ZwQueryInformationProcess(NtCurrentProcess(),
+ProcessImageFileName, buffer, size, nullptr);
+if(NT_SUCCESS(status)) {
+auto name = (UNICODE_STRING*)buffer;
+// do something with name...
+}
+ExFreePool(buffer);
+Example: Enumerating Processes
+The EnumProc driver shows how to call ZwQuerySystemInformation to retrieve the list of running
+processes. DriverEntry calls the EnumProcess function that does all the work and dumps information
+using simple DbgPrint calls. Then DriverEntry returns an error so the driver is unloaded.
+First, we need the definition of ZwQuerySystemInformation and the required enum value and
+structure which we can copy from Winternl.h:
+#include <ntddk.h>
+// copied from <WinTernl.h>
+enum SYSTEM_INFORMATION_CLASS {
+SystemProcessInformation = 5,
+};
+typedef struct _SYSTEM_PROCESS_INFORMATION {
+ULONG NextEntryOffset;
+
+===== [PDF page 265] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+259
+ULONG NumberOfThreads;
+UCHAR Reserved1[48];
+UNICODE_STRING ImageName;
+KPRIORITY BasePriority;
+HANDLE UniqueProcessId;
+PVOID Reserved2;
+ULONG HandleCount;
+ULONG SessionId;
+PVOID Reserved3;
+SIZE_T PeakVirtualSize;
+SIZE_T VirtualSize;
+ULONG Reserved4;
+SIZE_T PeakWorkingSetSize;
+SIZE_T WorkingSetSize;
+PVOID Reserved5;
+SIZE_T QuotaPagedPoolUsage;
+PVOID Reserved6;
+SIZE_T QuotaNonPagedPoolUsage;
+SIZE_T PagefileUsage;
+SIZE_T PeakPagefileUsage;
+SIZE_T PrivatePageCount;
+LARGE_INTEGER Reserved7[6];
+} SYSTEM_PROCESS_INFORMATION, * PSYSTEM_PROCESS_INFORMATION;
+extern "C" NTSTATUS ZwQuerySystemInformation(
+SYSTEM_INFORMATION_CLASS info,
+PVOID buffer,
+ULONG size,
+PULONG len);
+Notice there are lots of “resevred” members in SYSTEM_PROCESS_INFORMATION. We’ll manage with
+what we get, but you can find the full data structure in the Process Hacker project.
+EnumProc starts by querying the number of bytes needed by calling ZwQuerySystemInformation
+with a null buffer and zero size, getting the last parameter as the required size:
+void EnumProcesses() {
+ULONG size = 0;
+ZwQuerySystemInformation(SystemProcessInformation, nullptr, 0, &size);
+size += 1 << 12;
+// 4KB, just to make sure the next call succeeds
+We want to allocate some more in case new processes are created between this call and the next “real” call.
+We can write the code in a more robust way and have a loop that queries until the size is large enough,
+but the above solution is robust enough for most purposes.
+
+===== [PDF page 266] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+260
+Next, we allocate the required buffer and make the call again, this time with the real buffer:
+auto buffer = ExAllocatePoolWithTag(PagedPool, size, 'cprP');
+if (!buffer)
+return;
+if (NT_SUCCESS(ZwQuerySystemInformation(SystemProcessInformation,
+buffer, size, nullptr))) {
+if the call succeeds, we can start iterating. The returned pointer is to the first process, where the next process
+is located NextEntryOffset bytes from this offset. The enumeration ends when NextEntryOffset
+is zero:
+ULONG count = 0;
+for (;;) {
+DbgPrint("PID: %u Session: %u Handles: %u Threads: %u Image: %wZ\n",
+HandleToULong(info->UniqueProcessId),
+info->SessionId, info->HandleCount,
+info->NumberOfThreads, info->ImageName);
+count++;
+if (info->NextEntryOffset == 0)
+break;
+info = (SYSTEM_PROCESS_INFORMATION*)((PUCHAR)info + info->NextEntryOffset);
+}
+DbgPrint("Total Processes: %u\n", count);
+We output some of the details provided in the SYSTEM_PROCESS_INFORMATION structure and count the
+nnumber of processes while we’re at it. The only thing left to do in this simple example is to clean up:
+}
+ExFreePool(buffer);
+}
+As mentioned, DriverEntry is simple:
+
+===== [PDF page 267] =====
+Chapter 8: Advanced Programming Techniques (Part 1)
+261
+extern "C" NTSTATUS
+DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+UNREFERENCED_PARAMETER(DriverObject);
+UNREFERENCED_PARAMETER(RegistryPath);
+EnumProcesses();
+return STATUS_UNSUCCESSFUL;
+}
+Given this knowledge, we can make the KMelody driver a bit better by creating our thread in a Csrss.exe
+process for the current session, instead of the first client process that comes in. This is better, since Csrss
+always exists, and is in fact a critical process - one that if killed for whatever reason, causes the system to
+crash.
+Killing Csrss is not easy, since it’s a protected process starting with Windows 8.1, but kernel code can
+certainly do that.
+1. Modify the KMelody driver to create the thread in a Csrss process for the current session.
+Search for Csrss with ZwQuerySystemInformation and create the thread in that
+process.
+2. Add support for multiple sessions, where there is one playback thread per ses-
+sion. Hint: call ZwQueryInformationProcess with ProcessSessionId to find
+out the session a process is part of. Manage a list of PlaybackState ob-
+jects, one for each session. You can also use the undocumented (but exported)
+PsGetCurrentProcessSessionId API.
+Summary
+In this chapter, we were introduced to some programming techniques that are useful in many types of
+drivers. We’re not done with these techniques - there will be more in chapter 11. But for now, we can
+begin using some kernel-provided notifications, starting with Process and Thread notifications in the next
+chapter.

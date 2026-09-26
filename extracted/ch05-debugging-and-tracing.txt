@@ -1,0 +1,2194 @@
+CHAPTER 5: Debugging and Tracing (PDF pages 81-136)
+
+===== [PDF page 81] =====
+Chapter 5: Debugging and Tracing
+Just like with any software, kernel drivers tend to have bugs. Debugging drivers, as opposed to user-mode
+debugging, is more challenging. Driver debugging is essentially debugging an entire machine, not just
+a specific process. This requires a somewhat different mindset. This chapter discussed user-mode and
+kernel-mode debugging using the WinDbg debugger.
+In this chapter:
+• Debugging Tools for Windows
+• Introduction to WinDbg
+• Kernel Debugging
+• Full Kernel Debugging
+• Kernel Driver Debugging Tutorial
+• Asserts and Tracing
+Debugging Tools for Windows
+The Debugging Tools for Windows package contains a set of debuggers, tools, and documentation focusing
+on the debuggers within the package. This package can be installed as part of the Windows SDK or the
+WDK, but there is no real “installation” done. The installation just copies files but does not touch the
+Registry, meaning the package depends only on its own modules and the Windows built-in DLLs. This
+makes it easy to copy the entire directory to any other directory including removable media.
+The package contains four debuggers: Cdb.exe, Ntsd.Exe, Kd.exe, and WinDbg.exe. Here is a rundown of
+the basic functionality of each debugger:
+• Cdb and Ntsd are user-mode, console-based debuggers. This means they can be attached to processes,
+just like any other user-mode debugger. Both have console UI - type in a command, get a response,
+and repeat. The only difference between the two is that if launched from a console window, Cdb uses
+the same console, whereas Ntsd always opens a new console window. They are otherwise identical.
+• Kd is a kernel debugger with a console user interface. It can attach to the local kernel (Local
+Kernel Debugging, described in the next section), or to another machine for a full kernel debugging
+experience.
+• WinDbg is the only debugger with a graphical user interface. It can be used for user-mode debugging
+or kernel debugging, depending on the selection performed with its menus or the command line
+arguments passed to it when launched.
+
+===== [PDF page 82] =====
+Chapter 5: Debugging and Tracing
+76
+A relatively recent alternative to the classic WinDbg is Windbg Preview, available through the Microsoft
+store. This is a remake of the classic debugger with a much better user interface. It can be installed on
+Windows 10 version 1607 or later. From a functionality standpoint, it’s similar to the classic WinDbg. But
+it is somewhat easier to use because of the modern, convenient UI, and in fact has also solved some bugs
+that still plague the classic debugger. All the commands we’ll see in this chapter work equally well with
+either debugger.
+Although these debuggers may seem different from one another, the user-mode debuggers are essentially
+the same, as are the kernel debuggers. They are all based around a single debugger engine implemented
+as a DLL (DbgEng.Dll). The various debuggers are able to use extension DLLs, that provide most of the
+power of the debuggers by loading new commands.
+The Debugger Engine is documented to a large extent in the Debugging tools for Windows documentation,
+which makes it possible to write new debuggers (or other tools) that utilize the debugger engine.
+Other tools that are part of the package include the following (partial list):
+• Gflags.exe - the Global Flags tool that allows setting some kernel flags and image flags.
+• ADPlus.exe - generate a dump file for a process crash or hang.
+• Kill.exe - a simple tool to terminate process(es) based on process ID, name, or pattern.
+• Dumpchk.exe - tool to do some general checking of dump files.
+• TList.exe - lists running processes on the system with various options.
+• Umdh.exe - analyzes heap allocations in user-mode processes.
+• UsbView.exe - displays a hierarchical view of USB devices and hubs.
+Introduction to WinDbg
+This section describes the fundamentals of WinDbg, but bear in mind everything is essentially the same
+for the console debuggers, with the exception of the GUI windows.
+WinDbg is built around commands. The user enters a command, and the debugger responds with text
+describing the results of the command. With the GUI, some of these results are depicted in dedicated
+windows, such as locals, stack, threads, etc.
+WinDbg supports three types of commands:
+• Intrinsic commands - these commands are built-in into the debugger (part of the debugger engine),
+and they operate on the target being debugged.
+• Meta commands - these commands start with a period (.) and they operate on the debugging
+environment, rather than directly on the target being debugged.
+
+===== [PDF page 83] =====
+Chapter 5: Debugging and Tracing
+77
+• Extension commands (sometimes called bang commands) - these commands start with an ex-
+clamation point (!), providing much of the power of the debugger. All extension commands are
+implemented in external DLLs. By default, the debugger loads a set of predefined extension DLLs,
+but more can be loaded from the debugger directory or another directory with the .load meta
+command.
+Writing extension DLLs is possible and is fully documented in the debugger docs. In fact, many such DLLs
+have been created and can be loaded from their respective source. These DLLs provide new commands
+that enhance the debugging experience, often targeting specific scenarios.
+Tutorial: User mode debugging basics
+If you have experience with WinDbg usage in user-mode, you can safely skip this section.
+This tutorial is aimed at getting a basic understanding of WinDbg and how to use it for user-mode
+debugging. Kernel debugging is described in the next section.
+There are generally two ways to initiate user-mode debugging - either launch an executable and attach to
+it, or attach to an already existing process. We’ll use the latter approach in this tutorial, but except for this
+first step, all other operations are identical.
+• Launch Notepad.
+• Launch WinDbg (either the Preview or the classic one. The following screenshots use the Preview).
+• Select File / Attach To Process and locate the Notepad process in the list (see figure 5-1). Then click
+Attach. You should see output similar to figure 5-2.
+
+===== [PDF page 84] =====
+Chapter 5: Debugging and Tracing
+78
+Figure 5-1: Attaching to a process with WinDbg
+Figure 5-2: First view after process attach
+The Command window is the main window of interest - it should always be open. This is the one showing
+
+===== [PDF page 85] =====
+Chapter 5: Debugging and Tracing
+79
+the various responses of commands. Typically, most of the time in a debugging session is spent interacting
+with this window.
+The process is suspended - we are in a breakpoint induced by the debugger.
+• The first command we’ll use is ∼, which shows information about all threads in the debugged
+process:
+0:003> ~
+0
+Id: 874c.18068 Suspend: 1 Teb: 00000001`2229d000 Unfrozen
+1
+Id: 874c.46ac Suspend: 1 Teb: 00000001`222a5000 Unfrozen
+2
+Id: 874c.152cc Suspend: 1 Teb: 00000001`222a7000 Unfrozen
+.
+3
+Id: 874c.bb08 Suspend: 1 Teb: 00000001`222ab000 Unfrozen
+The exact number of threads you’ll see may be different than shown here.
+One thing that is very important is the existence of proper symbols. Microsoft provides a public symbol
+server, which allows locating symbols for most modules by produced by Microsoft. This is essential in any
+low-level debugging.
+• To set symbols quickly, enter the .symfix command.
+• A better approach is to set up symbols once and have them available for all future debugging sessions.
+To do that, add a system environment variable named _NT_SYMBOL_PATH and set it to a string
+like the following:
+SRV*c:\Symbols*http://msdl.microsoft.com/download/symbols
+The middle part (between asterisks) is a local path for caching symbols on your local machine; you
+can select any path you like (including a network share, if sharing with a team is desired). Once this
+environment variable is set, next invocations of the debugger will find symbols automatically and load
+them from the Microsoft symbol server as needed.
+The debuggers in the Debugging Tools for Windows are not the only tools that look for this
+environment variables. Sysinternals tools (e.g. Process Explorer, Process Monitor), Visual Studio,
+and others look for the same variable as well. You set it once, and get its benefit using multiple
+tools.
+• To make sure you have proper symbols, enter the lm (loaded modules) command:
+
+===== [PDF page 86] =====
+Chapter 5: Debugging and Tracing
+80
+0:003> lm
+start
+end
+module name
+00007ff7`53820000 00007ff7`53863000
+notepad
+(deferred)
+00007ffb`afbe0000 00007ffb`afca6000
+efswrt
+(deferred)
+...
+00007ffc`1db00000 00007ffc`1dba8000
+shcore
+(deferred)
+00007ffc`1dbb0000 00007ffc`1dc74000
+OLEAUT32
+(deferred)
+00007ffc`1dc80000 00007ffc`1dd22000
+clbcatq
+(deferred)
+00007ffc`1dd30000 00007ffc`1de57000
+COMDLG32
+(deferred)
+00007ffc`1de60000 00007ffc`1f350000
+SHELL32
+(deferred)
+00007ffc`1f500000 00007ffc`1f622000
+RPCRT4
+(deferred)
+00007ffc`1f630000 00007ffc`1f6e3000
+KERNEL32
+(pdb symbols)
+c:\symbols\ker\
+nel32.pdb\3B92DED9912D874A2BD08735BC0199A31\kernel32.pdb
+00007ffc`1f700000 00007ffc`1f729000
+GDI32
+(deferred)
+00007ffc`1f790000 00007ffc`1f7e2000
+SHLWAPI
+(deferred)
+00007ffc`1f8d0000 00007ffc`1f96e000
+sechost
+(deferred)
+00007ffc`1f970000 00007ffc`1fc9c000
+combase
+(deferred)
+00007ffc`1fca0000 00007ffc`1fd3e000
+msvcrt
+(deferred)
+00007ffc`1fe50000 00007ffc`1fef3000
+ADVAPI32
+(deferred)
+00007ffc`20380000 00007ffc`203ae000
+IMM32
+(deferred)
+00007ffc`203e0000 00007ffc`205cd000
+ntdll
+(pdb symbols)
+c:\symbols\ntd\
+ll.pdb\E7EEB80BFAA91532B88FF026DC6B9F341\ntdll.pdb
+The list of modules shows all modules (DLLs and the EXE) loaded into the debugged process at this time.
+You can see the start and end virtual addresses into which each module is loaded. Following the module
+name you can see the symbol status of this module (in parenthesis). Possible values include:
+• deferred - the symbols for this module were not needed in this debugging session so far, and so
+are not loaded at this time. The symbols will be loaded when needed (for example, if a call stack
+contains a function from that module). This is the default value.
+• pdb symbols - proper public symbols have been loaded. The local path of the PDB file is displayed.
+• private pdb symbols - private symbols are available. This would be the case for your own modules,
+compiled with Visual Studio. For Microsoft modules, this is very rare (at the time of writing,
+combase.dll is provided with private symbols). With private symbols, you have information about
+local variables and private types.
+• export symbols - only exported symbols are available for this DLL. This typically means there are
+no symbols for this module, but the debugger is able to use the exported sysmbols. It’s better than
+no symbols at all, but could be confusing, as the debugger will use the closet export it can find, but
+the real function is most likely different.
+• no symbols - this module’s symbols were attempted to be located, but nothing was found, not even
+exported symbols (such modules don’t have exported symbols, as is the case of an executable or
+driver files).
+You can force loading of a module’s symbols using the following command:
+
+===== [PDF page 87] =====
+Chapter 5: Debugging and Tracing
+81
+.reload /f modulename.dll
+This will provide definitive evidence to the availability of symbols for this module.
+Symbol paths can also be configured in the debugger’s settings dialog.
+Open the File / Settings menu and locate Debugging Settings. You can then add more paths for symbol
+searching. This is useful if debugging your own code, so you would like the debugger to search your
+directories where relevant PDB files may be found (see figure 5-3).
+Figure 5-3: Symbols and source paths configuration
+Make sure you have symbols configured correctly before you proceed. To diagnose any issues, you can
+enter the !sym noisy command that logs detailed information for symbol load attempts.
+Back to the thread list - notice that one of the threads has a dot in front of its data. This is the current
+thread as far as the debugger is concerned. This means that any command issued that involves a thread,
+where the thread is not explicitly specified, will work on that thread. This “current thread” is also shown
+in the prompt - the number to the right of the colon is the current thread index (3 in this example).
+Enter the k command, that shows the stack trace for the current thread:
+0:003> k
+# Child-SP
+RetAddr
+Call Site
+00 00000001`224ffbd8 00007ffc`204aef5b ntdll!DbgBreakPoint
+01 00000001`224ffbe0 00007ffc`1f647974 ntdll!DbgUiRemoteBreakin+0x4b
+02 00000001`224ffc10 00007ffc`2044a271 KERNEL32!BaseThreadInitThunk+0x14
+03 00000001`224ffc40 00000000`00000000 ntdll!RtlUserThreadStart+0x21
+
+===== [PDF page 88] =====
+Chapter 5: Debugging and Tracing
+82
+How can you tell that you don’t have proper symbols except using the lm command? If you see
+very large offsets from the beginning of a function, this is probably not the real function name
+- it’s just the closest one the debugger knows about. “Large offsets” is obviously a relative term,
+but a good rule of thumb is that a 4-hex digit offset is almost always wrong.
+You can see the list of calls made on this thread (user-mode only, of course). The top of the call stack in the
+above output is the function DbgBreakPoint located in the module ntdll.dll. The general format of
+addresses with symbols is modulename!functionname+offset. The offset is optional and could be
+zero if it’s exactly the start of this function. Also notice the module name is without an extension.
+In the output above, DbgBreakpoint was called by DbgUiRemoteBreakIn, which was called by
+BaseThreadInitThunk, and so on.
+This thread, by the way, was injected by the debugger in order to break into the target forcefully.
+To switch to a different thread, use the following command: ∼ns where n is the thread index. Let’s switch
+to thread 0 and then display its call stack:
+0:003> ~0s
+win32u!NtUserGetMessage+0x14:
+00007ffc`1c4b1164 c3
+ret
+0:000> k
+# Child-SP
+RetAddr
+Call Site
+00 00000001`2247f998 00007ffc`1d802fbd win32u!NtUserGetMessage+0x14
+01 00000001`2247f9a0 00007ff7`5382449f USER32!GetMessageW+0x2d
+02 00000001`2247fa00 00007ff7`5383ae07 notepad!WinMain+0x267
+03 00000001`2247fb00 00007ffc`1f647974 notepad!__mainCRTStartup+0x19f
+04 00000001`2247fbc0 00007ffc`2044a271 KERNEL32!BaseThreadInitThunk+0x14
+05 00000001`2247fbf0 00000000`00000000 ntdll!RtlUserThreadStart+0x21
+This is Notepad’s main (first) thread. The top of the stack shows the thread waiting for UI messages
+(win32u!NtUserGetMessage). The thread is actually waiting in kernel mode, but this is invisible from
+a user-mode debugger’s view.
+An alternative way to show the call stack of another thread without switching to it, is to use the tilde and
+thread number before the actual command. The following output is for thread 1’s stack:
+
+===== [PDF page 89] =====
+Chapter 5: Debugging and Tracing
+83
+0:000> ~1k
+# Child-SP
+RetAddr
+Call Site
+00 00000001`2267f4c8 00007ffc`204301f4 ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 00000001`2267f4d0 00007ffc`1f647974 ntdll!TppWorkerThread+0x274
+02 00000001`2267f7c0 00007ffc`2044a271 KERNEL32!BaseThreadInitThunk+0x14
+03 00000001`2267f7f0 00000000`00000000 ntdll!RtlUserThreadStart+0x21
+The above call stack is very common, and indicates a thread that is part of the thread pool.
+TppWorkerThread is the thread entry point for thread pool threads (Tpp is short for “Thread
+Pool Private”).
+Let’s go back to the list of threads:
+.
+0
+Id: 874c.18068 Suspend: 1 Teb: 00000001`2229d000 Unfrozen
+1
+Id: 874c.46ac Suspend: 1 Teb: 00000001`222a5000 Unfrozen
+2
+Id: 874c.152cc Suspend: 1 Teb: 00000001`222a7000 Unfrozen
+#
+3
+Id: 874c.bb08 Suspend: 1 Teb: 00000001`222ab000 Unfrozen
+Notice the dot has moved to thread 0 (current thread), revealing a hash sign (#) on thread 3. The thread
+marked with a hash (#) is the one that caused the last breakpoint (which in this case was our initial debugger
+attach).
+The basic information for a thread provided by the ∼command is shown in figure 5-4.
+Figure 5-4: Thread information for the ∼command
+Most numbers reported by WinDbg are hexadecimal by default. To convert a value to decimal, you can
+use the ? (evaluate expression) command.
+Type the following to get the decimal process ID (you can then compare to the reported PID in Task
+Manager):
+
+===== [PDF page 90] =====
+Chapter 5: Debugging and Tracing
+84
+0:000> ? 874c
+Evaluate expression: 34636 = 00000000`0000874c
+You can express decimal numbers with the 0n prefix, so you can get the inverse result as well:
+0:000> ? 0n34636
+Evaluate expression: 34636 = 00000000`0000874c
+The 0y prefix can be used in WinDbg to specify binary values. For example, using 0y1100 is
+the same as 0n12 as is 0xc. You can use the ? command to see the converted values.
+You can examine the TEB of a thread by using the !teb command. Using !teb without an address shows
+the TEB of the current thread:
+0:000> !teb
+TEB at 000000012229d000
+ExceptionList:
+0000000000000000
+StackBase:
+0000000122480000
+StackLimit:
+000000012246f000
+SubSystemTib:
+0000000000000000
+FiberData:
+0000000000001e00
+ArbitraryUserPointer: 0000000000000000
+Self:
+000000012229d000
+EnvironmentPointer:
+0000000000000000
+ClientId:
+000000000000874c . 0000000000018068
+RpcHandle:
+0000000000000000
+Tls Storage:
+000001c93676c940
+PEB Address:
+000000012229c000
+LastErrorValue:
+0
+LastStatusValue:
+8000001a
+Count Owned Locks:
+0
+HardErrorMode:
+0
+0:000> !teb 00000001`222a5000
+TEB at 00000001222a5000
+ExceptionList:
+0000000000000000
+StackBase:
+0000000122680000
+StackLimit:
+000000012266f000
+SubSystemTib:
+0000000000000000
+FiberData:
+0000000000001e00
+ArbitraryUserPointer: 0000000000000000
+Self:
+00000001222a5000
+
+===== [PDF page 91] =====
+Chapter 5: Debugging and Tracing
+85
+EnvironmentPointer:
+0000000000000000
+ClientId:
+000000000000874c . 00000000000046ac
+RpcHandle:
+0000000000000000
+Tls Storage:
+000001c936764260
+PEB Address:
+000000012229c000
+LastErrorValue:
+0
+LastStatusValue:
+c0000034
+Count Owned Locks:
+0
+HardErrorMode:
+0
+Some data shown by the !teb command is relatively known or easy to guess:
+• StackBase and StackLimit - user-mode current stack base and stack limit for the thread.
+• ClientId - process and thread IDs.
+• LastErrorValue - last Win32 error code (GetLastError).
+• TlsStorage - Thread Local Storage (TLS) array for this thread (full explanation of TLS is beyond the
+scope of this book).
+• PEB Address - address of the Process Environment Block (PEB), viewable with the !peb command.
+• LastStatusValue - last NTSTATUS value returned from a system call.
+• The !teb command (and similar commands) shows parts of the real data structure behind the
+scenes, in this case _TEB. You can always look at the real structure using the dt (display type)
+command:
+0:000> dt ntdll!_teb
++0x000 NtTib
+: _NT_TIB
++0x038 EnvironmentPointer : Ptr64 Void
++0x040 ClientId
+: _CLIENT_ID
++0x050 ActiveRpcHandle
+: Ptr64 Void
++0x058 ThreadLocalStoragePointer : Ptr64 Void
++0x060 ProcessEnvironmentBlock : Ptr64 _PEB
+...
++0x1808 LockCount
+: Uint4B
++0x180c WowTebOffset
+: Int4B
++0x1810 ResourceRetValue : Ptr64 Void
++0x1818 ReservedForWdf
+: Ptr64 Void
++0x1820 ReservedForCrt
+: Uint8B
++0x1828 EffectiveContainerId : _GUID
+Notice that WinDbg is not case sensitive when it comes to symbols. Also, notice the structure name starting
+with an underscore; this the way most structures are defined in Windows (user-mode and kernel-mode).
+Using the typedef name (without the underscore) may or may not work, so always using the underscore
+is recommended.
+
+===== [PDF page 92] =====
+Chapter 5: Debugging and Tracing
+86
+How do you know which module defines a structure you wish to view? If the structure
+is documented, the module would be listed in the docs for the structure. You can also try
+specifying the structure without the module name, forcing the debugger to search for it.
+Generally, you “know” where the structure is defined with experience and sometimes context.
+If you attach an address to the previous command, you can get the actual values of data members:
+0:000> dt ntdll!_teb 00000001`2229d000
++0x000 NtTib
+: _NT_TIB
++0x038 EnvironmentPointer : (null)
++0x040 ClientId
+: _CLIENT_ID
++0x050 ActiveRpcHandle
+: (null)
++0x058 ThreadLocalStoragePointer : 0x000001c9`3676c940 Void
++0x060 ProcessEnvironmentBlock : 0x00000001`2229c000 _PEB
++0x068 LastErrorValue
+: 0
+...
++0x1808 LockCount
+: 0
++0x180c WowTebOffset
+: 0n0
++0x1810 ResourceRetValue : 0x000001c9`3677fd00 Void
++0x1818 ReservedForWdf
+: (null)
++0x1820 ReservedForCrt
+: 0
++0x1828 EffectiveContainerId : _GUID {00000000-0000-0000-0000-000000000000}
+Each member is shown with its offset from the beginning of the structure, its name, and its value. Simple
+values are shown directly, while structure values (such as NtTib above) are shown with a hyperlink.
+Clicking this hyperlink provides the details of the structure.
+Click on the NtTib member above to show the details of this data member:
+0:000> dx -r1 (*((ntdll!_NT_TIB *)0x12229d000))
+(*((ntdll!_NT_TIB *)0x12229d000))
+[Type: _NT_TIB]
+[+0x000] ExceptionList
+: 0x0 [Type: _EXCEPTION_REGISTRATION_RECORD *]
+[+0x008] StackBase
+: 0x122480000 [Type: void *]
+[+0x010] StackLimit
+: 0x12246f000 [Type: void *]
+[+0x018] SubSystemTib
+: 0x0 [Type: void *]
+[+0x020] FiberData
+: 0x1e00 [Type: void *]
+[+0x020] Version
+: 0x1e00 [Type: unsigned long]
+[+0x028] ArbitraryUserPointer : 0x0 [Type: void *]
+[+0x030] Self
+: 0x12229d000 [Type: _NT_TIB *]
+The debugger uses the newer dx command to view data. See the section “Advanced Debugging with
+WinDbg” later in this chapter for more on the dx command.
+
+===== [PDF page 93] =====
+Chapter 5: Debugging and Tracing
+87
+If you don’t see hyperlinks, you may be using a very old WinDbg, where Debugger Markup Language
+(DML) is not on by default. You can turn it on with the .prefer_dml 1 command.
+Now let’s turn our attention to breakpoints. Let’s set a breakpoint when a file is opened by notepad.
+• Type the following command to set a breakpoint in the CreateFile API function:
+0:000> bp kernel32!createfilew
+Notice the function name is in fact CreateFileW, as there is no function called CreateFile. In code,
+this is a macro that expands to CreateFileW (wide, Unicode version) or CreateFileA (ASCII or Ansi
+version) based on a compilation constant named UNICODE. WinDbg responds with nothing. This is a good
+thing.
+The reason there are two sets of functions for most APIs where strings are involved is a historical
+one. In any case, Visual Studio projects define the UNICODE constant by default, so Unicode is
+the norm. This is a good thing - most of the A functions convert their input to Unicode and call
+the W function.
+You can list the existing breakpoints with the bl command:
+0:000> bl
+0 e Disable Clear
+00007ffc`1f652300
+0001 (0001)
+0:**** KERNEL32!CreateFileW
+You can see the breakpoint index (0), whether it’s enabled or disabled (e=enabled, d=disabled), and you
+get DML hyperlinks to disable (bd command) and delete (bc command) the breakpoint.
+Now let notepad continue execution, until the breakpoint hits:
+Type the g command or press the Go button on the toolbar or hit F5:
+You’ll see the debugger showing Busy in the prompt and the command area shows Debuggee is running,
+meaning you cannot enter commands until the next break.
+Notepad should now be alive. Go to its File menu and select Open…. The debugger should spew details of
+module loads and then break:
+
+===== [PDF page 94] =====
+Chapter 5: Debugging and Tracing
+88
+Breakpoint 0 hit
+KERNEL32!CreateFileW:
+00007ffc`1f652300 ff25aa670500
+jmp
+qword ptr [KERNEL32!_imp_CreateFileW \
+(00007ffc`1f6a8ab0)] ds:00007ffc`1f6a8ab0={KERNELBASE!CreateFileW (00007ffc`1c7\
+5e260)}
+• We have hit the breakpoint! Notice the thread in which it occurred. Let’s see what the call stack
+looks like (it may take a while to show if the debugger needs to download symbols from Microsoft’s
+symbol server):
+0:002> k
+# Child-SP
+RetAddr
+Call Site
+00 00000001`226fab08 00007ffc`061c8368 KERNEL32!CreateFileW
+01 00000001`226fab10 00007ffc`061c5d4d mscoreei!RuntimeDesc::VerifyMainRuntimeM\
+odule+0x2c
+02 00000001`226fab60 00007ffc`061c6068 mscoreei!FindRuntimesInInstallRoot+0x2fb
+03 00000001`226fb3e0 00007ffc`061cb748 mscoreei!GetOrCreateSxSProcessInfo+0x94
+04 00000001`226fb460 00007ffc`061cb62b mscoreei!CLRMetaHostPolicyImpl::GetReque\
+stedRuntimeHelper+0xfc
+05 00000001`226fb740 00007ffc`061ed4e6 mscoreei!CLRMetaHostPolicyImpl::GetReque\
+stedRuntime+0x120
+...
+21 00000001`226fede0 00007ffc`1df025b2 SHELL32!CFSIconOverlayManager::LoadNonlo\
+adedOverlayIdentifiers+0xaa
+22 00000001`226ff320 00007ffc`1df022af SHELL32!EnableExternalOverlayIdentifiers\
++0x46
+23 00000001`226ff350 00007ffc`1def434e SHELL32!CFSIconOverlayManager::RefreshOv\
+erlayImages+0xff
+24 00000001`226ff390 00007ffc`1cf250a3 SHELL32!SHELL32_GetIconOverlayManager+0x\
+6e
+25 00000001`226ff3c0 00007ffc`1ceb2726 windows_storage!CFSFolder::_GetOverlayIn\
+fo+0x12b
+26 00000001`226ff470 00007ffc`1cf3108b windows_storage!CAutoDestItemsFolder::Ge\
+tOverlayIndex+0xb6
+27 00000001`226ff4f0 00007ffc`1cf30f87 windows_storage!CRegFolder::_GetOverlayI\
+nfo+0xbf
+28 00000001`226ff5c0 00007ffb`df8fc4d1 windows_storage!CRegFolder::GetOverlayIn\
+dex+0x47
+29 00000001`226ff5f0 00007ffb`df91f095 explorerframe!CNscOverlayTask::_Extract+\
+0x51
+2a 00000001`226ff640 00007ffb`df8f70c2 explorerframe!CNscOverlayTask::InternalR\
+esumeRT+0x45
+
+===== [PDF page 95] =====
+Chapter 5: Debugging and Tracing
+89
+2b 00000001`226ff670 00007ffc`1cf7b58c explorerframe!CRunnableTask::Run+0xb2
+2c 00000001`226ff6b0 00007ffc`1cf7b245 windows_storage!CShellTask::TT_Run+0x3c
+2d 00000001`226ff6e0 00007ffc`1cf7b125 windows_storage!CShellTaskThread::Thread\
+Proc+0xdd
+2e 00000001`226ff790 00007ffc`1db32ac6 windows_storage!CShellTaskThread::s_Thre\
+adProc+0x35
+2f 00000001`226ff7c0 00007ffc`204521c5 shcore!ExecuteWorkItemThreadProc+0x16
+30 00000001`226ff7f0 00007ffc`204305c4 ntdll!RtlpTpWorkCallback+0x165
+31 00000001`226ff8d0 00007ffc`1f647974 ntdll!TppWorkerThread+0x644
+32 00000001`226ffbc0 00007ffc`2044a271 KERNEL32!BaseThreadInitThunk+0x14
+33 00000001`226ffbf0 00000000`00000000 ntdll!RtlUserThreadStart+0x21
+Your call stack may be different, as it depends on the Windows version, and any extensions that may be
+loaded and used by the open file dialog box.
+What can we do at this point? You may wonder what file is being opened. We can get that information
+based on the calling convention of the CreateFileW function. Since this is a 64-bit process (and the
+processor is Intel/AMD), the calling convention states that the first integer/pointer arguments are passed
+in the RCX, RDX, R8, and R9 registers (in this order). Since the file name in CreateFileW is the first
+argument, the relevant register is RCX.
+You can get more information on calling conventions in the Debugger documentation (or in several web
+resources).
+Display the value of the RCX register with the r command (you’ll get a different value):
+0:002> r rcx
+rcx=00000001226fabf8
+We can view the memory pointed by RCX with various d (display) family of commands. Here is the db
+command, interpreting the data as bytes.
+
+===== [PDF page 96] =====
+Chapter 5: Debugging and Tracing
+90
+0:002> db 00000001226fabf8
+00000001`226fabf8
+43 00 3a 00 5c 00 57 00-69 00 6e 00 64 00 6f 00
+C.:.\.W.i.n\
+.d.o.
+00000001`226fac08
+77 00 73 00 5c 00 4d 00-69 00 63 00 72 00 6f 00
+w.s.\.M.i.c\
+.r.o.
+00000001`226fac18
+73 00 6f 00 66 00 74 00-2e 00 4e 00 45 00 54 00
+s.o.f.t...N\
+.E.T.
+00000001`226fac28
+5c 00 46 00 72 00 61 00-6d 00 65 00 77 00 6f 00
+\.F.r.a.m.e\
+.w.o.
+00000001`226fac38
+72 00 6b 00 36 00 34 00-5c 00 5c 00 76 00 32 00
+r.k.6.4.\.\\
+.v.2.
+00000001`226fac48
+2e 00 30 00 2e 00 35 00-30 00 37 00 32 00 37 00
+..0...5.0.7\
+.2.7.
+00000001`226fac58
+5c 00 63 00 6c 00 72 00-2e 00 64 00 6c 00 6c 00
+\.c.l.r...d\
+.l.l.
+00000001`226fac68
+00 00 76 1c fc 7f 00 00-00 00 00 00 00 00 00 00
+..v........\
+.....
+The db command shows the memory in bytes, and ASCII characters on the right. It’s pretty clear what
+the file name is, but because the string is Unicode, it’s not very convenient to see.
+Use the du command to view Unicode string more conveniently:
+0:002> du 00000001226fabf8
+00000001`226fabf8
+"C:\Windows\Microsoft.NET\Framewo"
+00000001`226fac38
+"rk64\\v2.0.50727\clr.dll"
+You can use a register value directly by prefixing its name with @:
+0:002> du @rcx
+00000001`226fabf8
+"C:\Windows\Microsoft.NET\Framewo"
+00000001`226fac38
+"rk64\\v2.0.50727\clr.dll"
+Similarly, you can view the value of the second argument by looking at the rdx register.
+Now let’s set another breakpoint in the native API that is called by CreateFileW - NtCreateFile:
+0:002> bp ntdll!ntcreatefile
+0:002> bl
+0 e Disable Clear
+00007ffc`1f652300
+0001 (0001)
+0:**** KERNEL32!CreateFil\
+eW
+1 e Disable Clear
+00007ffc`20480120
+0001 (0001)
+0:**** ntdll!NtCreateFile
+Notice the native API never uses W or A - it always works with Unicode strings (in fact it expects
+UNICODE_STRING structures, as we’ve seen already).
+Continue execution with the g command. The debugger should break:
+
+===== [PDF page 97] =====
+Chapter 5: Debugging and Tracing
+91
+Breakpoint 1 hit
+ntdll!NtCreateFile:
+00007ffc`20480120 4c8bd1
+mov
+r10,rcx
+Check the call stack again:
+0:002> k
+# Child-SP
+RetAddr
+Call Site
+00 00000001`226fa938 00007ffc`1c75e5d6 ntdll!NtCreateFile
+01 00000001`226fa940 00007ffc`1c75e2c6 KERNELBASE!CreateFileInternal+0x2f6
+02 00000001`226faab0 00007ffc`061c8368 KERNELBASE!CreateFileW+0x66
+03 00000001`226fab10 00007ffc`061c5d4d mscoreei!RuntimeDesc::VerifyMainRuntimeM\
+odule+0x2c
+04 00000001`226fab60 00007ffc`061c6068 mscoreei!FindRuntimesInInstallRoot+0x2fb
+05 00000001`226fb3e0 00007ffc`061cb748 mscoreei!GetOrCreateSxSProcessInfo+0x94
+...
+List the next 8 instructions that are about to be executed with the u (unassemble or disassemble) command:
+0:002> u
+ntdll!NtCreateFile:
+00007ffc`20480120 4c8bd1
+mov
+r10,rcx
+00007ffc`20480123 b855000000
+mov
+eax,55h
+00007ffc`20480128 f604250803fe7f01 test
+byte ptr [SharedUserData+0x308 (0000\
+0000`7ffe0308)],1
+00007ffc`20480130 7503
+jne
+ntdll!NtCreateFile+0x15 (00007ffc`204\
+80135)
+00007ffc`20480132 0f05
+syscall
+00007ffc`20480134 c3
+ret
+00007ffc`20480135 cd2e
+int
+2Eh
+00007ffc`20480137 c3
+ret
+Notice the value 0x55 is copied to the EAX register. This is the system service number for NtCreateFile,
+as described in chapter 1. The syscall instruction shown is the one causing the transition to kernel-mode,
+and then executing the NtCreateFile system service itself.
+You can step over the next instruction with the p command (step - hit F10 as an alternative). You can step
+into a function (in case of assembly, this is the call instruction) with the t command (trace - hit F11 as
+an alternative):
+
+===== [PDF page 98] =====
+Chapter 5: Debugging and Tracing
+92
+0:002> p
+Breakpoint 1 hit
+ntdll!NtCreateFile:
+00007ffc`20480120 4c8bd1
+mov
+r10,rcx
+0:002> p
+ntdll!NtCreateFile+0x3:
+00007ffc`20480123 b855000000
+mov
+eax,55h
+0:002> p
+ntdll!NtCreateFile+0x8:
+00007ffc`20480128 f604250803fe7f01 test
+byte ptr [SharedUserData+0x308 (0000\
+0000`7ffe0308)],1 ds:00000000`7ffe0308=00
+0:002> p
+ntdll!NtCreateFile+0x10:
+00007ffc`20480130 7503
+jne
+ntdll!NtCreateFile+0x15 (00007ffc`204\
+80135) [br=0]
+0:002> p
+ntdll!NtCreateFile+0x12:
+00007ffc`20480132 0f05
+syscall
+Stepping inside a syscall is not possible, as we’re in user-mode. When we step over/into it, all is done
+and we get back a result.
+0:002> p
+ntdll!NtCreateFile+0x14:
+00007ffc`20480134 c3
+ret
+The return value of functions in x64 calling convention is stored in EAX or RAX. For system calls, it’s an
+NTSTATUS, so EAX contains the returned status:
+0:002> r eax
+eax=c0000034
+Zero means success, and a negative value (in two’s complement, most significant bit is set) means an error.
+We can get a textual description of the error with the !error command:
+0:002> !error @eax
+Error code: (NTSTATUS) 0xc0000034 (3221225524) - Object Name not found.
+This means the file wasn’t found on the system.
+Disable all breakpoints and let Notepad continue execution normally:
+
+===== [PDF page 99] =====
+Chapter 5: Debugging and Tracing
+93
+0:002> bd *
+0:002> g
+Since we have no breakpoints at this time, we can force a break by clicking the Break button on the toolbar,
+or hitting Ctrl+Break on the keyboard:
+874c.16a54): Break instruction exception - code 80000003 (first chance)
+ntdll!DbgBreakPoint:
+00007ffc`20483080 cc
+int
+3
+Notice the thread number in the prompt. Show all current threads:
+0:022> ~
+0
+Id: 874c.18068 Suspend: 1 Teb: 00000001`2229d000 Unfrozen
+1
+Id: 874c.46ac Suspend: 1 Teb: 00000001`222a5000 Unfrozen
+2
+Id: 874c.152cc Suspend: 1 Teb: 00000001`222a7000 Unfrozen
+3
+Id: 874c.f7ec Suspend: 1 Teb: 00000001`222ad000 Unfrozen
+4
+Id: 874c.145b4 Suspend: 1 Teb: 00000001`222af000 Unfrozen
+...
+18
+Id: 874c.f0c4 Suspend: 1 Teb: 00000001`222d1000 Unfrozen
+19
+Id: 874c.17414 Suspend: 1 Teb: 00000001`222d3000 Unfrozen
+20
+Id: 874c.c878 Suspend: 1 Teb: 00000001`222d5000 Unfrozen
+21
+Id: 874c.d8c0 Suspend: 1 Teb: 00000001`222d7000 Unfrozen
+. 22
+Id: 874c.16a54 Suspend: 1 Teb: 00000001`222e1000 Unfrozen
+23
+Id: 874c.10838 Suspend: 1 Teb: 00000001`222db000 Unfrozen
+24
+Id: 874c.10cf0 Suspend: 1 Teb: 00000001`222dd000 Unfrozen
+Lots of threads, right? These were created by the common open dialog, so not the direct fault of Notepad.
+Continue exploring the debugger in any way you want!
+Find out the system service numbers for NtWriteFile and NtReadFile.
+If you close Notepad, you’ll hit a breakpoint at process termination:
+
+===== [PDF page 100] =====
+Chapter 5: Debugging and Tracing
+94
+ntdll!NtTerminateProcess+0x14:
+00007ffc`2047fc14 c3
+ret
+0:000> k
+# Child-SP
+RetAddr
+Call Site
+00 00000001`2247f6a8 00007ffc`20446dd8 ntdll!NtTerminateProcess+0x14
+01 00000001`2247f6b0 00007ffc`1f64d62a ntdll!RtlExitUserProcess+0xb8
+02 00000001`2247f6e0 00007ffc`061cee58 KERNEL32!ExitProcessImplementation+0xa
+03 00000001`2247f710 00007ffc`0644719e mscoreei!RuntimeDesc::ShutdownAllActiveR\
+untimes+0x287
+04 00000001`2247fa00 00007ffc`1fcda291 mscoree!ShellShim_CorExitProcess+0x11e
+05 00000001`2247fa30 00007ffc`1fcda2ad msvcrt!_crtCorExitProcess+0x4d
+06 00000001`2247fa60 00007ffc`1fcda925 msvcrt!_crtExitProcess+0xd
+07 00000001`2247fa90 00007ff7`5383ae1e msvcrt!doexit+0x171
+08 00000001`2247fb00 00007ffc`1f647974 notepad!__mainCRTStartup+0x1b6
+09 00000001`2247fbc0 00007ffc`2044a271 KERNEL32!BaseThreadInitThunk+0x14
+0a 00000001`2247fbf0 00000000`00000000 ntdll!RtlUserThreadStart+0x21
+You can use the q command to quit the debugger. If the process is still alive, it will be terminated. An
+alternative is to use the .detach command to disconnect from the target without killing it.
+Kernel Debugging
+User-mode debugging involves the debugger attaching to a process, setting breakpoints that cause the
+process’ threads to become suspended, and so on. Kernel-mode debugging, on the other hand, involves
+controlling the entire machine with the debugger. This means that if a breakpoint is set and then hit, the
+entire machine is frozen. Clearly, this cannot be achieved with a single machine. In full kernel debugging,
+two machines are involved: a host (where the debugger runs) and a target (being debugged). The target can,
+however, be a virtual machine hosted on the same machine (host) where the debugger executes. Figure
+5-5 shows a host and target connected via some connection medium.
+Figure 5-5: Host-target connection
+Before we get into full kernel debugging, we’ll take a look at its simpler cousin - local kernel debugging.
+Local Kernel Debugging
+Local kernel debugging (LKD) allows viewing system memory and other system information on the local
+machine. The primary difference between local and full kernel debugging, is that with LKD there is no
+
+===== [PDF page 101] =====
+Chapter 5: Debugging and Tracing
+95
+way to set up breakpoints, which means you’re always looking at the current state of the system. It also
+means that things change, even while commands are being executed, so some information may be stale
+or unreliable. With full kernel debugging, commands can only be entered while the target system is in a
+breakpoint, so system state is unchanged.
+To configure LKD, enter the following in an elevated command prompt and then restart the system:
+bcdedit /debug on
+Local Kernel Debugging is protected by Secure Boot on Windows 10, Server 2016, and later. To
+activate LKD you’ll have to disable Secure Boot in the machine’s BIOS settings. If, for whatever
+reason, this is not possible, there is an alternative using the Sysinternals LiveKd tool. Copy
+LiveKd.exe to the Debugging Tools for Windows main directory. Then launch WinDbg using
+LiveKd with the following command: livekd -w. The experience is not the same, as data may
+become stale because of the way Livekd works, and you may need to exit the debugger and
+relaunch from time to time.
+After the system is restarted, launch WinDbg elevated (the 64-bit one, if you are on a 64-bit system). Select
+the menu File / Attach To Kernel (WinDbg preview) or File / Kernel Debug… (classic WinDbg). Select the
+Local tab and click OK. You should see output similar to the following:
+Microsoft (R) Windows Debugger Version 10.0.22415.1003 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+Connected to Windows 10 22000 x64 target at (Wed Sep 29 10:57:30.682 2021 (UTC \
++ 3:00)), ptr64 TRUE
+************* Path validation summary **************
+Response
+Time (ms)
+Location
+Deferred
+SRV*c:\symbols*https://msdl.micr\
+osoft.com/download/symbols
+Symbol search path is: SRV*c:\symbols*https://msdl.microsoft.com/download/symbo\
+ls
+Executable search path is:
+Windows 10 Kernel Version 22000 MP (6 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS
+Edition build lab: 22000.1.amd64fre.co_release.210604-1628
+Machine Name:
+Kernel base = 0xfffff802`07a00000 PsLoadedModuleList = 0xfffff802`08629710
+Debug session time: Wed Sep 29 10:57:30.867 2021 (UTC + 3:00)
+System Uptime: 0 days 16:44:39.106
+Note the prompt displays lkd. This indicates Local Kernel Debugging is active.
+
+===== [PDF page 102] =====
+Chapter 5: Debugging and Tracing
+96
+Local kernel Debugging Tutorial
+If you’re familiar with kernel debugging commands, you can safely skip this section.
+You can display basic information for all processes running on the system with the process 0 0
+command:
+lkd> !process 0 0
+**** NT ACTIVE PROCESS DUMP ****
+PROCESS ffffd104936c8040
+SessionId: none
+Cid: 0004
+Peb: 00000000
+ParentCid: 0000
+DirBase: 006d5000
+ObjectTable: ffffa58d3cc44d00
+HandleCount: 3909.
+Image: System
+PROCESS ffffd104936e2080
+SessionId: none
+Cid: 0058
+Peb: 00000000
+ParentCid: 0004
+DirBase: 0182c000
+ObjectTable: ffffa58d3cc4ea40
+HandleCount:
+0.
+Image: Secure System
+PROCESS ffffd1049370a080
+SessionId: none
+Cid: 0090
+Peb: 00000000
+ParentCid: 0004
+DirBase: 011b6000
+ObjectTable: ffffa58d3cc65a80
+HandleCount:
+0.
+Image: Registry
+PROCESS ffffd10497dd0080
+SessionId: none
+Cid: 024c
+Peb: bc6c2ba000
+ParentCid: 0004
+DirBase: 10be4b000
+ObjectTable: ffffa58d3d49ddc0
+HandleCount:
+60.
+Image: smss.exe
+...
+For each process, the following information is displayed:
+• The address attached to the PROCESS text is the EPROCESS address of the process (in kernel space,
+of course).
+• SessionId - the session the process is running under.
+• Cid - (client ID) the unique process ID.
+• Peb - the address of the Process Environment Block (PEB). This address is in user space, naturally.
+• ParentCid - (parent client ID) the process ID of the parent process. Note that it’s possible the parent
+process no longer exists, so this ID may belong to some process created after the parent process
+terminated.
+• DirBase - physical address of the Master Page Directory for this process, used as the basis for virtual
+to physical address translation. On x64, this is known as Page Map Level 4, and on x86 it’s Page
+Directory Pointer Table (PDPT).
+• ObjectTable - pointer to the private handle table for the process.
+
+===== [PDF page 103] =====
+Chapter 5: Debugging and Tracing
+97
+• HandleCount - number of handles in the handle table for this process.
+• Image - executable name, or special process name for those not associated with an executable (such
+as Secure System, System, Mem Compression).
+The !process command accepts at least two arguments. The first indicates the process of interest using its
+EPROCESS address or the unique Process ID, where zero means “all or any process”. The second argument
+is the level of detail to display (a bit mask), where zero means the least amount of detail. A third argument
+can be added to search for a particular executable. Here are a few examples:
+List all processes running explorer.exe:
+lkd> !process 0 0 explorer.exe
+PROCESS ffffd1049e118080
+SessionId: 1
+Cid: 1780
+Peb: 0076b000
+ParentCid: 16d0
+DirBase: 362ea5000
+ObjectTable: ffffa58d45891680
+HandleCount: 3208.
+Image: explorer.exe
+PROCESS ffffd104a14e2080
+SessionId: 1
+Cid: 2548
+Peb: 005c1000
+ParentCid: 0314
+DirBase: 140fe9000
+ObjectTable: ffffa58d46a99500
+HandleCount: 2613.
+Image: explorer.exe
+List more information for a specific process by specifying its address and a higher level of detail:
+lkd> !process ffffd1049e7a60c0 1
+PROCESS ffffd1049e7a60c0
+SessionId: 1
+Cid: 1374
+Peb: d3e343000
+ParentCid: 0314
+DirBase: 37eb97000
+ObjectTable: ffffa58d58a9de00
+HandleCount: 224.
+Image: dllhost.exe
+VadRoot ffffd104b81c7db0 Vads 94 Clone 0 Private 455. Modified 2. Locked 0.
+DeviceMap ffffa58d41354230
+Token
+ffffa58d466e0060
+ElapsedTime
+01:04:36.652
+UserTime
+00:00:00.015
+KernelTime
+00:00:00.015
+QuotaPoolUsage[PagedPool]
+201696
+QuotaPoolUsage[NonPagedPool]
+13048
+Working Set Sizes (now,min,max)
+(4330, 50, 345) (17320KB, 200KB, 1380KB)
+PeakWorkingSetSize
+4581
+VirtualSize
+2101383 Mb
+PeakVirtualSize
+2101392 Mb
+PageFaultCount
+5427
+MemoryPriority
+BACKGROUND
+BasePriority
+8
+
+===== [PDF page 104] =====
+Chapter 5: Debugging and Tracing
+98
+CommitCharge
+678
+Job
+ffffd104a05ed380
+As can be seen from the above output, more information on the process is displayed. Some of this
+information is hyperlinked, allowing easy further examination. For example, the job this process is part of
+(if any) is a hyperlink, executing the !job command if clicked.
+Click on the Job address hyperlink:
+lkd> !job ffffd104a05ed380
+Job at ffffd104a05ed380
+Basic Accounting Information
+TotalUserTime:
+0x0
+TotalKernelTime:
+0x0
+TotalCycleTime:
+0x0
+ThisPeriodTotalUserTime:
+0x0
+ThisPeriodTotalKernelTime: 0x0
+TotalPageFaultCount:
+0x0
+TotalProcesses:
+0x1
+ActiveProcesses:
+0x1
+FreezeCount:
+0
+BackgroundCount:
+0
+TotalTerminatedProcesses:
+0x0
+PeakJobMemoryUsed:
+0x2f5
+PeakProcessMemoryUsed:
+0x2f5
+Job Flags
+[wake notification allocated]
+[wake notification enabled]
+[timers virtualized]
+Limit Information (LimitFlags: 0x800)
+Limit Information (EffectiveLimitFlags: 0x403800)
+JOB_OBJECT_LIMIT_BREAKAWAY_OK
+A Job is a kernel object that manages one or more processes, for which it can apply various
+limits and get accounting information. A discussion of jobs is beyond the scope of this book.
+More information can be found in the Windows Internals 7th edition part 1 and Windows 10
+System Programming, Part 1 books.
+As usual, a command such as !job hides some information available in the real data structure. In this
+case, the typoe is EJOB. Use the command dt nt!_ejob with the job address to see all the details.
+The PEB of a process can be viewed as well by clicking its hyperlink. This is similar to the !peb command
+used in user mode, but the twist here is that the correct process context must be set first, as the address is
+in user space. Click the Peb hyperlink. You should see something like this:
+
+===== [PDF page 105] =====
+Chapter 5: Debugging and Tracing
+99
+lkd> .process /p ffffd1049e7a60c0; !peb d3e343000
+Implicit process is now ffffd104`9e7a60c0
+PEB at 0000000d3e343000
+InheritedAddressSpace:
+No
+ReadImageFileExecOptions: No
+BeingDebugged:
+No
+ImageBaseAddress:
+00007ff661180000
+NtGlobalFlag:
+0
+NtGlobalFlag2:
+0
+Ldr
+00007ffb37ef9120
+Ldr.Initialized:
+Yes
+Ldr.InInitializationOrderModuleList: 000001d950004560 . 000001d95005a960
+Ldr.InLoadOrderModuleList:
+000001d9500046f0 . 000001d95005a940
+Ldr.InMemoryOrderModuleList:
+000001d950004700 . 000001d95005a950
+Base TimeStamp
+Module
+7ff661180000 93f44fbf Aug 29 00:12:31 2048 C:\WINDOWS\system32\DllH\
+ost.exe
+7ffb37d80000 50702a8c Oct 06 15:56:44 2012 C:\WINDOWS\SYSTEM32\ntdl\
+l.dll
+7ffb36790000 ae0b35b0 Jul 13 01:50:24 2062 C:\WINDOWS\System32\KERN\
+EL32.DLL
+...
+The correct process context is set with the .process meta command, and then the PEB is displayed.
+This is a general technique you need to use to show memory that is in user space - always make sure the
+debugger is set to the correct process context.
+Execute the !process command again, but with the second bit set for the details:
+lkd> !process ffffd1049e7a60c0 2
+PROCESS ffffd1049e7a60c0
+SessionId: 1
+Cid: 1374
+Peb: d3e343000
+ParentCid: 0314
+DirBase: 37eb97000
+ObjectTable: ffffa58d58a9de00
+HandleCount: 221.
+Image: dllhost.exe
+THREAD ffffd104a02de080
+Cid 1374.022c
+Teb: 0000000d3e344000 Win32Thread: \
+ffffd104b82ccbb0 WAIT: (UserRequest) UserMode Non-Alertable
+ffffd104b71d2860
+SynchronizationEvent
+THREAD ffffd104a45e8080
+Cid 1374.0f04
+Teb: 0000000d3e352000 Win32Thread: \
+ffffd104b82ccd90 WAIT: (WrUserRequest) UserMode Non-Alertable
+ffffd104adc5e0c0
+QueueObject
+THREAD ffffd104a229a080
+Cid 1374.1ed8
+Teb: 0000000d3e358000 Win32Thread: \
+
+===== [PDF page 106] =====
+Chapter 5: Debugging and Tracing
+100
+ffffd104b82cf900 WAIT: (UserRequest) UserMode Non-Alertable
+ffffd104b71dfb60
+NotificationEvent
+ffffd104ad02a740
+QueueObject
+THREAD ffffd104b78ee040
+Cid 1374.0330
+Teb: 0000000d3e37a000 Win32Thread: \
+0000000000000000 WAIT: (WrQueue) UserMode Alertable
+ffffd104adc4f640
+QueueObject
+Detail level 2 shows a summary of the threads in the process along with the object(s) they are waiting on
+(if any).
+You can use other detail values (4, 8), or combine them, such as 3 (1 or 2).
+Repeat the !process command again, but this time with no detail level. More information is shown for
+the process (the default in this case is full details):
+lkd> !process ffffd1049e7a60c0
+PROCESS ffffd1049e7a60c0
+SessionId: 1
+Cid: 1374
+Peb: d3e343000
+ParentCid: 0314
+DirBase: 37eb97000
+ObjectTable: ffffa58d58a9de00
+HandleCount: 223.
+Image: dllhost.exe
+VadRoot ffffd104b81c7db0 Vads 94 Clone 0 Private 452. Modified 2. Locked 0.
+DeviceMap ffffa58d41354230
+Token
+ffffa58d466e0060
+ElapsedTime
+01:10:30.521
+UserTime
+00:00:00.015
+KernelTime
+00:00:00.015
+QuotaPoolUsage[PagedPool]
+201696
+QuotaPoolUsage[NonPagedPool]
+13048
+Working Set Sizes (now,min,max)
+(4329, 50, 345) (17316KB, 200KB, 1380KB)
+PeakWorkingSetSize
+4581
+VirtualSize
+2101383 Mb
+PeakVirtualSize
+2101392 Mb
+PageFaultCount
+5442
+MemoryPriority
+BACKGROUND
+BasePriority
+8
+CommitCharge
+678
+Job
+ffffd104a05ed380
+THREAD ffffd104a02de080
+Cid 1374.022c
+Teb: 0000000d3e344000 Win32Thread: \
+ffffd104b82ccbb0 WAIT: (UserRequest) UserMode Non-Alertable
+ffffd104b71d2860
+SynchronizationEvent
+Not impersonating
+DeviceMap
+ffffa58d41354230
+
+===== [PDF page 107] =====
+Chapter 5: Debugging and Tracing
+101
+Owning Process
+ffffd1049e7a60c0
+Image:
+dllhost.exe
+Attached Process
+N/A
+Image:
+N/A
+Wait Start TickCount
+3641927
+Ticks: 270880 (0:01:10:32.500)
+Context Switch Count
+27
+IdealProcessor: 2
+UserTime
+00:00:00.000
+KernelTime
+00:00:00.000
+Win32 Start Address 0x00007ff661181310
+Stack Init ffffbe88b4bdf630 Current ffffbe88b4bdf010
+Base ffffbe88b4be0000 Limit ffffbe88b4bd9000 Call 0000000000000000
+Priority 8 BasePriority 8 PriorityDecrement 0 IoPriority 2 PagePriority 5
+Kernel stack not resident.
+THREAD ffffd104a45e8080
+Cid 1374.0f04
+Teb: 0000000d3e352000 Win32Thread: \
+ffffd104b82ccd90 WAIT: (WrUserRequest) UserMode Non-Alertable
+ffffd104adc5e0c0
+QueueObject
+Not impersonating
+DeviceMap
+ffffa58d41354230
+Owning Process
+ffffd1049e7a60c0
+Image:
+dllhost.exe
+Attached Process
+N/A
+Image:
+N/A
+Wait Start TickCount
+3910734
+Ticks: 2211 (0:00:00:34.546)
+Context Switch Count
+2684
+IdealProcessor: 4
+UserTime
+00:00:00.046
+KernelTime
+00:00:00.078
+Win32 Start Address 0x00007ffb3630f230
+Stack Init ffffbe88b4c87630 Current ffffbe88b4c86a10
+Base ffffbe88b4c88000 Limit ffffbe88b4c81000 Call 0000000000000000
+Priority 10 BasePriority 8 PriorityDecrement 0 IoPriority 2 PagePriority 5
+Child-SP
+RetAddr
+Call Site
+ffffbe88`b4c86a50 fffff802`07c5dc17
+nt!KiSwapContext+0x76
+ffffbe88`b4c86b90 fffff802`07c5fac9
+nt!KiSwapThread+0x3a7
+ffffbe88`b4c86c70 fffff802`07c59d24
+nt!KiCommitThreadWait+0x159
+ffffbe88`b4c86d10 fffff802`07c8ac70
+nt!KeWaitForSingleObject+0x234
+ffffbe88`b4c86e00 fffff9da`6d577d46
+nt!KeWaitForMultipleObjects+0x540
+ffffbe88`b4c86f00 fffff99c`c175d920
+0xfffff9da`6d577d46
+ffffbe88`b4c86f08 fffff99c`c175d920
+0xfffff99c`c175d920
+ffffbe88`b4c86f10 00000000`00000001
+0xfffff99c`c175d920
+ffffbe88`b4c86f18 ffffd104`9a423df0
+0x1
+ffffbe88`b4c86f20 00000000`00000001
+0xffffd104`9a423df0
+ffffbe88`b4c86f28 ffffbe88`b4c87100
+0x1
+ffffbe88`b4c86f30 00000000`00000000
+0xffffbe88`b4c87100
+...
+The command lists all threads within the process. Each thread is represented by its ETHREAD address
+attached to the text “THREAD”. The call stack is listed as well - the module prefix “nt” represents the
+
+===== [PDF page 108] =====
+Chapter 5: Debugging and Tracing
+102
+kernel - there is no need to use the real kernel module name.
+One of the reasons to use “nt” instead of explicitly stating the kernel’s module name is because these are
+different between 64 and 32 bit systems (ntoskrnl.exe on 64 bit, and mtkrnlpa.exe on 32 bit); and it’s a
+lot shorter.
+User-mode symbols are not loaded by default, so thread stacks that span to user mode show just numeric
+addresses. You can load user symbols explicitly with .reload /user after setting the process context to
+the process of interest with the .process command:
+lkd> !process 0 0 explorer.exe
+PROCESS ffffd1049e118080
+SessionId: 1
+Cid: 1780
+Peb: 0076b000
+ParentCid: 16d0
+DirBase: 362ea5000
+ObjectTable: ffffa58d45891680
+HandleCount: 3217.
+Image: explorer.exe
+PROCESS ffffd104a14e2080
+SessionId: 1
+Cid: 2548
+Peb: 005c1000
+ParentCid: 0314
+DirBase: 140fe9000
+ObjectTable: ffffa58d46a99500
+HandleCount: 2633.
+Image: explorer.exe
+lkd> .process /p ffffd1049e118080
+Implicit process is now ffffd104`9e118080
+lkd> .reload /user
+Loading User Symbols
+................................................................
+lkd> !process ffffd1049e118080
+PROCESS ffffd1049e118080
+SessionId: 1
+Cid: 1780
+Peb: 0076b000
+ParentCid: 16d0
+DirBase: 362ea5000
+ObjectTable: ffffa58d45891680
+HandleCount: 3223.
+Image: explorer.exe
+...
+THREAD ffffd1049e47c400
+Cid 1780.1754
+Teb: 000000000078c000 Win32Thread: \
+ffffd1049e5da7a0 WAIT: (WrQueue) UserMode Alertable
+ffffd1049e076480
+QueueObject
+IRP List:
+ffffd1049fbea9b0: (0006,0478) Flags: 00060000
+Mdl: 00000000
+ffffd1049efd6aa0: (0006,0478) Flags: 00060000
+Mdl: 00000000
+ffffd1049efee010: (0006,0478) Flags: 00060000
+Mdl: 00000000
+ffffd1049f3ef8a0: (0006,0478) Flags: 00060000
+Mdl: 00000000
+Not impersonating
+
+===== [PDF page 109] =====
+Chapter 5: Debugging and Tracing
+103
+DeviceMap
+ffffa58d41354230
+Owning Process
+ffffd1049e118080
+Image:
+explorer.exe
+Attached Process
+N/A
+Image:
+N/A
+Wait Start TickCount
+3921033
+Ticks: 7089 (0:00:01:50.765)
+Context Switch Count
+16410
+IdealProcessor: 5
+UserTime
+00:00:00.265
+KernelTime
+00:00:00.234
+Win32 Start Address ntdll!TppWorkerThread (0x00007ffb37d96830)
+Stack Init ffffbe88b5fc7630 Current ffffbe88b5fc6d20
+Base ffffbe88b5fc8000 Limit ffffbe88b5fc1000 Call 0000000000000000
+Priority 9 BasePriority 8 PriorityDecrement 0 IoPriority 2 PagePriority 5
+Child-SP
+RetAddr
+Call Site
+ffffbe88`b5fc6d60 fffff802`07c5dc17
+nt!KiSwapContext+0x76
+ffffbe88`b5fc6ea0 fffff802`07c5fac9
+nt!KiSwapThread+0x3a7
+ffffbe88`b5fc6f80 fffff802`07c62526
+nt!KiCommitThreadWait+0x159
+ffffbe88`b5fc7020 fffff802`07c61f38
+nt!KeRemoveQueueEx+0x2b6
+ffffbe88`b5fc70d0 fffff802`07c6479c
+nt!IoRemoveIoCompletion+0x98
+ffffbe88`b5fc71f0 fffff802`07e25075
+nt!NtWaitForWorkViaWorkerFactory+0x\
+39c
+ffffbe88`b5fc7430 00007ffb`37e26e84
+nt!KiSystemServiceCopyEnd+0x25 (Tra\
+pFrame @ ffffbe88`b5fc74a0)
+00000000`03def858 00007ffb`37d96b0f
+ntdll!NtWaitForWorkViaWorkerFactory\
++0x14
+00000000`03def860 00007ffb`367a54e0
+ntdll!TppWorkerThread+0x2df
+00000000`03defb50 00007ffb`37d8485b
+KERNEL32!BaseThreadInitThunk+0x10
+00000000`03defb80 00000000`00000000
+ntdll!RtlUserThreadStart+0x2b
+...
+Notice the thread above has issued several IRPs as well. We’ll discuss this in greater detail in chapter 7.
+A thread’s information can be viewed separately with the !thread command and the address of the
+thread. Check the debugger documentation for the description of the various pieces of information
+displayed by this command.
+Other generally useful/interesting commands in kernel-mode debugging include:
+• !pcr - display the Process Control Region (PCR) for a processor specified as an additional index
+(processor 0 is displayed by default if no index is specified).
+• !vm - display memory statistics for the system and processes.
+• !running - displays information on threads running on all processors on the system.
+We’ll look at more specific commands useful for debugging drivers in subsequent chapters.
+
+===== [PDF page 110] =====
+Chapter 5: Debugging and Tracing
+104
+Full Kernel Debugging
+Full kernel debugging requires configuration on the host and target. In this section, we’ll see how to
+configure a virtual machine as a target for kernel debugging. This is the recommended and most convenient
+setup for kernel driver work (when not developing device drivers for hardware). We’ll go through the
+steps for configuring a Hyper-V virtual machine. If you’re using a different virtualization technology (e.g.
+VMWare or VirtualBox), please consult that product’s documentation or the web for the correct procedure
+to get the same results.
+The target and host machine×“ must communicate using some communication media. There are several
+options available. The fastest communication option is to use the network. Unfortunately, this requires the
+host and target to run Windows 8 at a minimum. Since Windows 7 is still a viable target, there is another
+convenient option - the COM (serial) port, which can be exposed as a named pipe to the host machine. All
+virtualization platforms allow redirecting a virtual serial port to a named pipe on the host. We’ll look at
+both options.
+Just like Local Kernel Debugging, the target machine cannot use Secure Boot. With full kernel
+debugging, there is no workaround.
+Using a Virtual Serial Port
+In this section, we’ll configure the target and host to use a virtual COM port exposed as a named pipe to
+the host. In the next section, we’ll configure kernel debugging using the network.
+Configuring the Target
+The target VM must be configured for kernel debugging, similar to local kernel debugging, but with the
+added connection media set to a virtual serial port on that machine.
+One way to do the configuration is using bcdedit in an elevated command window:
+bcdedit /debug on
+bcdedit /dbgsettings serial debugport:1 baudrate:115200
+Change the debug port number according to the actual virtual serial number (typically 1).
+The VM must be restarted for these configurations to take effect. Before you do that, we can map the serial
+port to a named pipe. Here is the procedure for Hyper-V virtual machines:
+If the Hyper-V VM is Generation 1 (older), there is a simple UI in the VM’s settings to do the configuration.
+Use the Add Hardware option to add a serial port if there are none defined. Then configure the serial port
+to be mapped to a named port of your choosing. Figure 5-6 shows this dialog.
+
+===== [PDF page 111] =====
+Chapter 5: Debugging and Tracing
+105
+Figure 5-6: Mapping serial port to named pipe for Hyper-V Gen-1 VM
+For Generation 2 VMs, no UI is currently available. To configure this, make sure the VM is shut down, and
+open an elevated PowerShell window.
+Type the following to set a serial port mapped to a named pipe:
+PS C:\>Set-VMComPort myvmname -Number 1 -Path "\\.\pipe\debug"
+Change the VM name appropriately and the COM port number as set inside the VM earlier with bcdedit.
+Make sure the pipe path is unique.
+You can verify the settings are as expected with Get-VMComPort:
+
+===== [PDF page 112] =====
+Chapter 5: Debugging and Tracing
+106
+PS C:\>Get-VMComPort myvmname
+VMName
+Name
+Path
+------
+----
+----
+myvmname COM 1 \\.\pipe\debug
+myvmname COM 2
+You can boot the VM - the target is now ready.
+Configuring the Host
+The kernel debugger must be properly configured to connect with the VM on the same serial port mapped
+to the same named pipe exposed on the host.
+Launch the kernel debugger elevated, and select File / Attach To Kernel. Navigate to the COM tab. Fill in
+the correct details as they were set on the target. Figure 5-7 shows what these settings look like.
+Figure 5-7: Setting host COM port configuration
+Click OK. The debugger should attach to the target. If it does not, click the Break toolbar button. Here is
+some typical output:
+
+===== [PDF page 113] =====
+Chapter 5: Debugging and Tracing
+107
+Microsoft (R) Windows Debugger Version 10.0.18317.1001 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+Opened \\.\pipe\debug
+Waiting to reconnect...
+Connected to Windows 10 18362 x64 target at (Sun Apr 21 11:28:11.300 2019 (UTC \
++ 3:00)), ptr64 TRUE
+Kernel Debugger connection established.
+(Initial Breakpoint requested)
+************* Path validation summary **************
+Response
+Time (ms)
+Location
+Deferred
+SRV*c:\Symbols*http://msdl.micro\
+soft.com/download/symbols
+Symbol search path is: SRV*c:\Symbols*http://msdl.microsoft.com/download/symbols
+Executable search path is:
+Windows 10 Kernel Version 18362 MP (4 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS
+Built by: 18362.1.amd64fre.19h1_release.190318-1202
+Machine Name:
+Kernel base = 0xfffff801`36a09000 PsLoadedModuleList = 0xfffff801`36e4c2d0
+Debug session time: Sun Apr 21 11:28:09.669 2019 (UTC + 3:00)
+System Uptime: 1 days 0:12:28.864
+Break instruction exception - code 80000003 (first chance)
+*******************************************************************************
+*
+*
+*
+You are seeing this message because you pressed either
+*
+*
+CTRL+C (if you run console kernel debugger) or,
+*
+*
+CTRL+BREAK (if you run GUI kernel debugger),
+*
+*
+on your debugger machine's keyboard.
+*
+*
+*
+*
+THIS IS NOT A BUG OR A SYSTEM CRASH
+*
+*
+*
+* If you did not intend to break into the debugger, press the "g" key, then
+*
+* press the "Enter" key now.
+This message might immediately reappear.
+If it *
+* does, press "g" and "Enter" again.
+*
+*
+*
+*******************************************************************************
+nt!DbgBreakPointWithStatus:
+fffff801`36bcd580 cc
+int
+3
+Note the prompt has an index and the word kd. The index is the current processor that induced the break.
+At this point, the target VM is completely frozen. You can now debug normally, bearing in mind anytime
+you break somewhere, the entire machine is frozen.
+
+===== [PDF page 114] =====
+Chapter 5: Debugging and Tracing
+108
+Using the Network
+In this section, we’ll configure full kernel debugging using the network, focusing on the differences
+compared to the virtual COM port setup.
+Configuring the Target
+On the target machine, running with an elevated command window, configure network debugging using
+the following format with bcdedit:
+bcdedit /dbgsettings net hostip:<ip> port: <port> [key: <key>]
+The hostip must be the IP address of the host accessible from the target. port can be any available port on
+the host, but the documentation recommends working with port 50000 and up. The key is optional. If you
+don’t specify it, the command generates a random key. For example:
+c:/>bcdedit /dbgsettings net hostip:10.100.102.53 port:51111
+Key=1rhvit77hdpv7.rxgwjdvhxj7v.312gs2roip4sf.3w25wrjeocobh
+The alternative is provide your own key for simplicity, which must be in the format a.b.c.d. This is
+acceptable from a security standpoint when working with local virtual machines:
+c:/>bcdedit /dbgsettings net hostip:10.100.102.53 port:51111 key:1.2.3.4
+Key=1.2.3.4
+You can always display the current debug configuration with /dbgsettings alone:
+c:\>bcdedit /dbgsettings
+key
+1.2.3.4
+debugtype
+NET
+hostip
+10.100.102.53
+port
+51111
+dhcp
+Yes
+The operation completed successfully.
+Finally, restart the target.
+Configuring the Host
+On the host machine, launch the debugger and select the File / Attach the Kernel option (or File / Kernel
+Debug… in the classic WinDbg). Navigate to the NET tab, and enter the information corresponding to your
+settings (figure 5-7).
+
+===== [PDF page 115] =====
+Chapter 5: Debugging and Tracing
+109
+Figure 5-8: Attach to kernel dialog
+You may need to click the Break button (possibly multiple times) to establish a connection. More in-
+formation and troubeshooting tips can be found at https://docs.microsoft.com/en-us/windows-hardware/
+drivers/debugger/setting-up-a-network-debugging-connection.
+Kernel Driver Debugging Tutorial
+Once host and target are connected, debugging can begin. We will use the Booster driver we developed in
+chapter 4 to demonstrate full kernel debugging.
+Install (but don’t load) the driver on the target as was done in chapter 4. Make sure you copy the driver’s
+PDB file alongside the driver SYS file itself. This simplifies getting correct symbols for the driver.
+Let’s set a breakpoint in DriverEntry. We cannot load the driver just yet because that would cause
+DriverEntry to execute, and we’ll miss the chance to set a breakpoint there. Since the driver is not
+loaded yet, we can use the bu command (unresolved breakpoint) to set a future breakpoint. Break into the
+target if it’s currently running, and type the following command in the debugger:
+0: kd> bu booster!driverentry
+0: kd> bl
+0 e Disable Clear u
+0001 (0001) (booster!driverentry)
+The breakpoint is unresolved at this point, since our module (driver) is not yet loaded. The debugger will
+re-evaluate the breakpoint any time a new module is loaded.
+Issue the g command to let the target continue execution, and load the driver with sc start booster
+(assuming the driver’s name is booster). If all goes well, the breakpoint should hit, and the source file
+should open automatically, showing the following output in the command window:
+
+===== [PDF page 116] =====
+Chapter 5: Debugging and Tracing
+110
+0: kd> g
+Breakpoint 0 hit
+Booster!DriverEntry:
+fffff802`13da11c0 4889542410
+mov
+qword ptr [rsp+10h],rdx
+The index on the left of the colon is the CPU index running the code when the breakpoint hit
+(CPU 0 in the above output).
+Figure 5-9 shows a screenshot of WinDbg Preview source window automatically opening and the correct
+line marked. The Locals window is also shown as expected.
+
+===== [PDF page 117] =====
+Chapter 5: Debugging and Tracing
+111
+Figure 5-9: Breakpoint hit in DriverEntry
+
+===== [PDF page 118] =====
+Chapter 5: Debugging and Tracing
+112
+At this point, you can step over source lines, look at variables in the Locals window, and even add
+expressions to the Watch window. You can also change values using the Locals window just like you
+would normally do with other debuggers.
+The Command window is still available as always, but some operations are just easier with the GUI. Setting
+breakpoints, for example, can be done with the normal bp command, but you can simply open a source
+file (if it’s not already open), go to the line where you want to set a breakpoint, and hit F9 or click the
+appropriate button on the toolbar. Either way, the bp command will be executed in the Command window.
+The Breakpoints window can serve as a quick overview of the currently set breakpoints.
+• Issue the k command to see how DriverEntry is being invoked:
+0: kd> k
+# Child-SP
+RetAddr
+Call Site
+00 ffffbe88`b3f4f138 fffff802`13da5020
+Booster!DriverEntry [D:\Dev\windowsk\
+ernelprogrammingbook2e\Chapter04\Booster\Booster.cpp @ 9]
+01 ffffbe88`b3f4f140 fffff802`081cafc0
+Booster!GsDriverEntry+0x20 [minkerne\
+l\tools\gs_support\kmode\gs_support.c @ 128]
+02 ffffbe88`b3f4f170 fffff802`080858e2
+nt!PnpCallDriverEntry+0x4c
+03 ffffbe88`b3f4f1d0 fffff802`081aeab7
+nt!IopLoadDriver+0x8ba
+04 ffffbe88`b3f4f380 fffff802`07c48aaf
+nt!IopLoadUnloadDriver+0x57
+05 ffffbe88`b3f4f3c0 fffff802`07d5b615
+nt!ExpWorkerThread+0x14f
+06 ffffbe88`b3f4f5b0 fffff802`07e16c24
+nt!PspSystemThreadStartup+0x55
+07 ffffbe88`b3f4f600 00000000`00000000
+nt!KiStartSystemThread+0x34
+If breakpoints fail to hit, it may be a symbols issue. Execute the .reload command and see
+if the issues are resolved. Setting breakpoints in user space is also possible, but first execute
+.reload /user to force the debugger to load user-mode symbols.
+It may be the case that a breakpoint should hit only when a specific process is the one executing the code.
+This can be done by adding the /p switch to a breakpoint. In the following example, a breakpoint is set
+only if the process is a specific explorer.exe:
+0: kd> !process 0 0 explorer.exe
+PROCESS ffffd1049e118080
+SessionId: 1
+Cid: 1780
+Peb: 0076b000
+ParentCid: 16d0
+DirBase: 362ea5000
+ObjectTable: ffffa58d45891680
+HandleCount: 3918.
+Image: explorer.exe
+PROCESS ffffd104a14e2080
+SessionId: 1
+Cid: 2548
+Peb: 005c1000
+ParentCid: 0314
+DirBase: 140fe9000
+ObjectTable: ffffa58d46a99500
+HandleCount: 4524.
+
+===== [PDF page 119] =====
+Chapter 5: Debugging and Tracing
+113
+Image: explorer.exe
+0: kd> bp /p ffffd1049e118080 booster!boosterwrite
+0: kd> bl
+0 e Disable Clear
+fffff802`13da11c0
+[D:\Dev\Chapter04\Booster\Booster.cp\
+p @ 9]
+0001 (0001) Booster!DriverEntry
+1 e Disable Clear
+fffff802`13da1090
+[D:\Dev\Chapter04\Booster\Booster.cp\
+p @ 61]
+0001 (0001) Booster!BoosterWrite
+Match process data ffffd104`9e118080
+Let’s set a normal breakpoint somewhere in the BoosterWrite function, by hitting F9 on the line in
+source view, as shown in figure 5-10 (the earlier conditional breakpoint is shown as well).
+Figure 5-10: Breakpoint hit in DriverEntry
+Listing the breakpoints reflect the new breakpoint with the offset calculated by the debugger:
+
+===== [PDF page 120] =====
+Chapter 5: Debugging and Tracing
+114
+0: kd> bl
+0 e Disable Clear
+fffff802`13da11c0
+[D:\Dev\Chapter04\Booster\Booster.cpp @\
+9]
+0001 (0001) Booster!DriverEntry
+1 e Disable Clear
+fffff802`13da1090
+[D:\Dev\Chapter04\Booster\Booster.cpp @\
+61] 0001 (0001) Booster!BoosterWrite
+Match process data ffffd104`9e118080
+2 e Disable Clear
+fffff802`13da10af
+[D:\Dev\Chapter04\Booster\Booster.cpp @\
+65] 0001 (0001) Booster!BoosterWrite+0x1f
+Enter the g command to release the target, and then run the boost application with some thread ID and
+priority:
+c:\Test> boost 5964 30
+The breakpoint within BoosterWrite should hit:
+Breakpoint 2 hit
+Booster!BoosterWrite+0x1f:
+fffff802`13da10af 488b4c2468
+mov
+rcx,qword ptr [rsp+68h]
+You can continue debugging normally, looking at local variables, stepping over/into functions, etc.
+Finally, if you would like to disconnect from the target, enter the .detach command. If it does not resume
+the target, click the Stop Debugging toolbar button (you may need to click it multiple times).
+Asserts and Tracing
+Although using a debugger is sometimes necessary, some coding can go a long way in making a debugger
+less needed. In this section we’ll examine asserts and powerful logging that is suitable for both debug and
+release builds of a driver.
+Asserts
+Just like in user mode, asserts can be used to verify that certain assumptions are correct. An invalid
+assumption means something is very wrong, so it’s best to stop. The WDK header provides the NT_ASSERT
+macro for this purpose.
+NT_ASSERT accepts something that can be converted to a Boolean value. If the result is non-zero (true),
+execution continues. Otherwise, the assertion has failed, and the system takes one of the following actions:
+• If a kernel debugger is attached, an assertion failure breakpoint is raised, allowing debugging the
+assertion.
+• If a kernel debugger is not attached, the system bugchecks. The resulting dump file will poinpoint
+the exact line where the assertion has failed.
+Here is a simple assert usage added to the DriverEntry function in the Booster driver from chapter 4:
+
+===== [PDF page 121] =====
+Chapter 5: Debugging and Tracing
+115
+extern "C" NTSTATUS
+DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
+DriverObject->DriverUnload = BoosterUnload;
+DriverObject->MajorFunction[IRP_MJ_CREATE] = BoosterCreateClose;
+DriverObject->MajorFunction[IRP_MJ_CLOSE] = BoosterCreateClose;
+DriverObject->MajorFunction[IRP_MJ_WRITE] = BoosterWrite;
+UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\Booster");
+PDEVICE_OBJECT DeviceObject;
+NTSTATUS status = IoCreateDevice(
+DriverObject,
+// our driver object
+0,
+// no need for extra bytes
+&devName,
+// the device name
+FILE_DEVICE_UNKNOWN,
+// device type
+0,
+// characteristics flags
+FALSE,
+// not exclusive
+&DeviceObject);
+// the resulting pointer
+if (!NT_SUCCESS(status)) {
+KdPrint(("Failed to create device object (0x%08X)\n", status));
+return status;
+}
+NT_ASSERT(DeviceObject);
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\Booster");
+status = IoCreateSymbolicLink(&symLink, &devName);
+if (!NT_SUCCESS(status)) {
+KdPrint(("Failed to create symbolic link (0x%08X)\n", status));
+IoDeleteDevice(DeviceObject);
+return status;
+}
+NT_ASSERT(NT_SUCCESS(status));
+return STATUS_SUCCESS;
+}
+The first assert makes sure the device object pointer is non-NULL:
+NT_ASSERT(DeviceObject);
+The second makes sure the status at the end of DriverEntry is a successful one:
+
+===== [PDF page 122] =====
+Chapter 5: Debugging and Tracing
+116
+NT_ASSERT(NT_SUCCESS(status));
+NT_ASSERT only compiles its expression in Debug builds, which makes using asserts practically free from
+a performance standpoint, as these will not be part of the final released driver. This also means you need
+to be careful that the expression inside NT_ASSERT has no side effects. For example, the following code
+is wrong:
+NT_ASSERT(NT_SUCCESS(IoCreateSymbolicLink(...)));
+This is because the call to IoCreateSymbolicLink will disappear completely in Release build. The
+correct way to assert would be something like the following:
+status = IoCreateSymbolicLink(...);
+NT_ASSERT(NT_SUCCESS(status));
+Asserts are useful and should be used liberally because they only have an effect in Debug builds.
+Extended DbgPrint
+We’ve seen usage of the DbgPrint function (and the KdPrint macro) to generate output that can be
+viewed with the kernel debugger or a comparable tool, such as DebugView. This works, and is simple to
+use, but has some significant downsides:
+• All the output is generated - there is no easy way to filter output to show just some output (such
+as errors and warnings only). This is partially mitigated with the extended DbgPrintEx function
+described in the next paragraph.
+• DbgPrint(Ex) is a relatively slow function, which is why it’s mostly used with KdPrint so that
+the overhead is removed in Release builds. But output in Release builds could be very important.
+Some bugs may only happen in Release builds, where good output could be useful for diagnosing
+issues.
+• There is no semantic meaning associated with DbgPrint - it’s just text. There is no way to add
+values with property name or type information.
+• There is no built-in way to save the output to a file rather than just see it in the debugger. if using
+DebugView, it allows saving its output to a file.
+The output from DbgPrint(Ex) is limited to 512 bytes. Any remaining bytes are lost.
+The DbgPrintEx function (and the associated KdPrintEx macro) were added to provide some filtering
+support for DbgPrint output:
+
+===== [PDF page 123] =====
+Chapter 5: Debugging and Tracing
+117
+ULONG DbgPrintEx (
+_In_ ULONG ComponentId,
+_In_ ULONG Level,
+_In_z_ _Printf_format_string_ PCSTR Format,
+...);
+// any number of args
+A list of component Ids is present in the <dpfilter.h> header (common to user and kernel mode), currently
+containing 155 valid values (0 to 154). Most values are used by the kernel and Microsoft drivers, except for
+a handlful that are meant to be used by third-party drivers:
+• DPFLTR_IHVVIDEO_ID (78) - for video drivers.
+• DPFLTR_IHVAUDIO_ID (79) - for audio drivers.
+• DPFLTR_IHVNETWORK_ID (80) - for network drivers.
+• DPFLTR_IHVSTREAMING_ID (81) - for streaming drivers.
+• DPFLTR_IHVBUS_ID (82) - for bus drivers.
+• DPFLTR_IHVDRIVER_ID (77) - for all other drivers.
+• DPFLTR_DEFAULT_ID (101) - used with DbgPrint or if an illegal component number is used.
+For most drivers, the DPFLTR_IHVDRIVER_ID component ID should be used.
+The Level parameter indicates the severity of the message (error, warning, information, etc.), but can
+technically mean anything you want. The interpretation of this value depends on whether the value is
+between 0 and 31, or greater than 31:
+• 0 to 31 - the level is a single bit formed by the expression 1 << Level. For example, if Level is 5,
+then the value is 32.
+• Anything greater than 31 - the value is used as is.
+<dpfilter.h> defines a few constants that can be used as is for Level:
+#define DPFLTR_ERROR_LEVEL
+0
+#define DPFLTR_WARNING_LEVEL 1
+#define DPFLTR_TRACE_LEVEL
+2
+#define DPFLTR_INFO_LEVEL
+3
+You can define more (or different) values as needed. The final result of whether the output will make its
+way to its destination depends on the component ID, the bit mask formed by the Level argument, and on
+a global mask read from the Debug Print Filter Registry key at system startup. Since the Debug Print Filter
+key does not exist by default, there is a default value for all component IDs, which is zero. This means that
+actual level value is 1 (1 << 0). The output will go through if either of the following conditions is true
+(value is the value specified by the Level argument to DbgPrintEx):
+• If value & (Debug print Filter value for that component) is non-zero, the output
+goes through. With the default, it’s (value & 1) != 0.
+
+===== [PDF page 124] =====
+Chapter 5: Debugging and Tracing
+118
+• If the result of the value ANDed with the Level of the ComponentId is non-zero, the output goes
+through.
+If neither is true, the output is dropped.
+Setting the component ID level can be done in one of three ways:
+• Using the Debug Print Filter key under HKLM\System\CCS\Control\Session Manager. DWORD values
+can be specified where their name is the macro name of a component ID without the prefix or suffix.
+For example, for DPFLTR_IHVVIDEO_ID, you would set the name to “IHVVIDEO”.
+• If a kernel debugger is connected, the level of a component can be changed during debugging. For
+example, the following command changes the level of DPFLTR_IHVVIDEO_ID to 0x1ff:
+ed Kd_IHVVIDEO_Mask 0x1ff
+The Debug Print Filter value can also be changed with the kernel debugger by using the global
+kernel variable Kd_WIN2000_Mask.
+• The last option is to make the change through the NtSetDebugFilterState native API. It’s
+undocumented, but it may be useful in practice. The Dbgkflt tool, available in the Tools folder in
+the book’s samples repositpry, makes use of this API (and its query counterpart, NtQueryDebug-
+FilterState), so that changes can be made even if a kernel debugger is not attached.
+If NtSetDebugFilterState is called from user mode, the caller must have the Debug privilege in
+its token. Since administrators have this privilege by default (but not non-admin users), you must run
+dbgkflt from an elevated command window for the change to succeed.
+The kernel-mode APIs provided by the <wdm.h> are DbgQueryDebugFilterState and
+DbgSetDebugFilterState. These are still undocumented, but at least their declaration is
+available. They use the same parameters and return type as their native invokers. This means
+you can call these APIs from the driver itself if desired (perhaps based on configuration read
+from the Registry).
+
+===== [PDF page 125] =====
+Chapter 5: Debugging and Tracing
+119
+Using Dbgkflt
+Running Dbgkflt with no arguments shows its usage.
+To query the effective level of a given component, add the component name (without the prefix or suffix).
+For example:
+dbgkflt default
+This returns the effective bits for the DPFLTR_DEFAULT_ID component. To change the value to
+something else, specify the value you want. It’s always ORed with 0x80000000 so that the bits you
+specify are directly used, rather than interpreting numbers lower than 32 as (1 << number). For
+example, the following sets the first 4 bits for the DEFAULT component:
+dbgkflt default 0xf
+DbgPrint is just a shortcut that calls DbgPrintEx with the DPFLTR_DEFAULT_ID component like so
+(this is conceptual and will not compile):
+ULONG DbgPrint (PCSTR Format, arguments) {
+return DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, Format, arguments);
+}
+This explains why the DWORD named DEFAULT with a value of 8 (1 << DPFLTR_INFO_LEVEL) is the
+value to write in the Registry to get DbgPrint output to go through.
+Given the above details, a driver can use DbgPrintEx (or the KdPrintEx macro) to specify different
+levels so that output can be filtered as needed. Each call, however, may be somewhat verbose. For example:
+DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+"Booster: DriverEntry called. Registry Path: %wZ\n", RegistryPath);
+Obviously, we might prefer a simpler function that always uses DPFLTR_IHVDRIVER_ID (the one that
+should be used for generic third-party drivers), like so:
+Log(DPFLTR_INFO_LEVEL,
+"Booster: DriverEntry called. Registry Path: %wZ\n", RegistryPath);
+We can go even further by defining specific functions that use the a log level implicitly:
+LogInfo("Booster: DriverEntry called. Registry Path: %wZ\n", RegistryPath);
+Here is an example where we define several bits to be used by creating an enumeration (there is no necessity
+to used the defined ones):
+
+===== [PDF page 126] =====
+Chapter 5: Debugging and Tracing
+120
+enum class LogLevel {
+Error = 0,
+Warning,
+Information,
+Debug,
+Verbose
+};
+Each value is associated with a small number (below 32), so that the values are interpreted as powers of
+two by DbgPrintEx. Now we can define functions like the following:
+ULONG Log(LogLevel level, PCSTR format, ...);
+ULONG LogError(PCSTR format, ...);
+ULONG LogWarning(PCSTR format, ...);
+ULONG LogInfo(PCSTR format, ...);
+ULONG LogDebug(PCSTR format, ...);
+and so on. Log is the most generic function, while the others use a predefined log level. Here is the
+implementation of the first two functions:
+#include <stdarg.h>
+ULONG Log(LogLevel level, PCSTR format, ...) {
+va_list list;
+va_start(list, format);
+return vDbgPrintEx(DPFLTR_IHVDRIVER_ID,
+static_cast<ULONG>(level), format, list);
+}
+ULONG LogError(PCSTR format, ...) {
+va_list list;
+va_start(list, format);
+return vDbgPrintEx(DPFLTR_IHVDRIVER_ID,
+static_cast<ULONG>(LogLevel::Error), format, list);
+}
+The use of static_cast in the above code is required in C++, as scoped enums don’t
+automatically convert to integers. You can use a C-style cast instead, if you prefer. If you’re
+using pure C, change the scoped enum to a standard enum (remove the class keyword).
+The return value from the various DbgPrint variants is typed as a ULONG, but is in fact a
+standard NTSTATUS.
+
+===== [PDF page 127] =====
+Chapter 5: Debugging and Tracing
+121
+The implementation uses the classic C variable arguments ellipsis (...) and implements these as you
+would in standard C. The implementation calls vDbgPrintEx that accepts a va_list, which is necessary
+for this to work correctly.
+It’s possible to create something more elaborate using the C++ variadic template feature. This
+is left as an exercise to the interested (and enthusiastic) reader.
+The above code can be found in the Booster2 project, part of the samples for this chapter. As part of that
+project, here are a few examples where these functions are used:
+// in DriverEntry
+Log(LogLevel::Information, "Booster2: DriverEntry called. Registry Path: %wZ\n"\
+,
+RegistryPath);
+// unload routine
+LogInfo("Booster2: unload called\n");
+// when an error is encountered creating a device object
+LogError("Failed to create device object (0x%08X)\n", status);
+// error locating thread ID
+LogError("Failed to locate thread %u (0x%X)\n",
+data->ThreadId, status);
+// success in changing thread priority
+LogInfo("Priority for thread %u changed from %d to %d\n",
+data->ThreadId, oldPriority, data->Priority);
+Other Debugging Functions
+The previous section used vDebugPrintEx, defined like so:
+ULONG vDbgPrintEx(
+_In_ ULONG ComponentId,
+_In_ ULONG Level,
+_In_z_ PCCH Format,
+_In_ va_list arglist);
+It’s identical to DbgPrintEx, except its last argument is an already constructed va_list. A wrapper
+macro exists as well - vKdPrintEx (compiled in Debug builds only).
+Lastly, there is yet another extended function for printing - cDbgPrintExWithPrefix:
+
+===== [PDF page 128] =====
+Chapter 5: Debugging and Tracing
+122
+ULONG vDbgPrintExWithPrefix (
+_In_z_ PCCH Prefix,
+_In_ ULONG ComponentId,
+_In_ ULONG Level,
+_In_z_ PCCH Format,
+_In_ va_list arglist);
+It adds a prefix (first parameter) to the output. This is useful to distinguish our driver from other drivers
+using the same functions. It also allows easy filtering in tools such as DebugView. For example, this code
+snippet shown earlier uses an explicit prefix:
+LogInfo("Booster2: unload called\n");
+We can define one as a macro, and use it as the first word in any output like so:
+#define DRIVER_PREFIX "Booster2: "
+LogInfo(DRIVER_PREFIX "unload called\n");
+This works, but it could be nicer by adding the prefix in every call automatically, by calling vDbgPrint-
+ExWithPrefix instead of vDbgPrintEx in the Log implementations. For example:
+ULONG Log(LogLevel level, PCSTR format, ...) {
+va_list list;
+va_start(list, format);
+return vDbgPrintExWithPrefix("Booster2", DPFLTR_IHVDRIVER_ID,
+static_cast<ULONG>(level), format, list);
+}
+Complete the implementation of the Log functions variants.
+Trace Logging
+Using DbgPrint and its variants is convenient enough, but as discussed earlier has some drawbacks.
+Trace logging is a powerful alternative (or complementary) that uses Event Tracing for Windows (ETW)
+for logging purposes, that can be captured live or to a log file. ETW has the additional benefits of being
+performant (can be used to log thousands of events per second without any noticeable delay), and has
+semantic information not available with the simple strings generated by the DbgPrint functions.
+
+===== [PDF page 129] =====
+Chapter 5: Debugging and Tracing
+123
+Trace logging can be used in exactly the same way in user mode as well.
+ETW is beyond the scope of this book. You can find more information in the official
+documentation or in my book “Windows 10 System Programming, Part 2”.
+To get started with trace logging, an ETW provider has to be defined. Contrary to “classic” ETW, no
+provider registration is necessary, as trace logging ensures the even metadata is part of the logged
+information, and as such is self-contained.
+A provider must have a unique GUID. You can generate one with the Create GUID tool available with
+Visual Studio (Tools menu). Figure 5-11 shows a screenshot of the tool with the second radio button selected,
+as it’s the closest to the format we need. Click the Copy button to copy that text to the clipboard.
+Figure 5-11: The Create GUID tool
+Paste the text to the main source file of the driver and change the pasted macro to TRACELOGGING_-
+DEFINE_PROVIDER to look like this:
+
+===== [PDF page 130] =====
+Chapter 5: Debugging and Tracing
+124
+// {B2723AD5-1678-446D-A577-8599D3E85ECB}
+TRACELOGGING_DEFINE_PROVIDER(g_Provider, "Booster", \
+(0xb2723ad5, 0x1678, 0x446d, 0xa5, 0x77, 0x85, 0x99, 0xd3, 0xe8, 0x5e, 0xcb\
+));
+g_Provider is a global variable created to represent the ETW provider, where “Booster” is set as its
+friendly name.
+You will need to add the following #includes (these are common with user-mode):
+#include <TraceLoggingProvider.h>
+#include <evntrace.h>
+In DriverEntry, call TraceLoggingRegister to register the provider:
+TraceLoggingRegister(g_Provider);
+Similarly, the provider should be deregistered in the unload routine like so:
+TraceLoggingUnregister(g_Provider);
+The logging is done with the TraceLoggingWrite macro that is provided a variable number of
+arguments using another set of macros that provide convenient usage for typed properties. Here is an
+example of a logging call in DriverEntry:
+TraceLoggingWrite(g_Provider, "DriverEntry started",
+// provider, event name
+TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+// log level
+TraceLoggingValue("Booster Driver", "DriverName"),
+// value, name
+TraceLoggingUnicodeString(RegistryPath, "RegistryPath"));
+// value, name
+The above call means the following:
+• Use the provider described by g_Provider.
+• The event name is “DriverEntry started”.
+• The logging level is Information (several levels are defined).
+• A property named “DriverName” has the value “Boster Driver”.
+• A property named “RegistryPath” has the value of the RegistryPath variable.
+Notice the usage of the TraceLoggingValue macro - it’s the most generic and uses the type inferred by
+the first argument (the value). Many other type-safe macros exist, such as the TraceLoggingUnicode-
+String macro above that ensures its first argument is indeed a UNICODE_STRING.
+Here is another example - if symbolic link creation fails:
+
+===== [PDF page 131] =====
+Chapter 5: Debugging and Tracing
+125
+TraceLoggingWrite(g_Provider, "Error",
+TraceLoggingLevel(TRACE_LEVEL_ERROR),
+TraceLoggingValue("Symbolic link creation failed", "Message"),
+TraceLoggingNTStatus(status, "Status", "Returned status"));
+You can use any “properties” you want. Try to provide the most important details for the event.
+Here are a couple of more examples, taken from the Booster project part of the samples for this chapter:
+// Create/Close dispatch IRP
+TraceLoggingWrite(g_Provider, "Create/Close",
+TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+TraceLoggingValue(
+IoGetCurrentIrpStackLocation(Irp)->MajorFunction == IRP_MJ_CREATE ?
+"Create" : "Close", "Operation"));
+// success in changing priority
+TraceLoggingWrite(g_Provider, "Boosting",
+TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+TraceLoggingUInt32(data->ThreadId, "ThreadId"),
+TraceLoggingInt32(oldPriority, "OldPriority"),
+TraceLoggingInt32(data->Priority, "NewPriority"));
+Viewing ETW Traces
+Where do all the above traces go to? Normally, they are just dropped. Someone has to configure listening to
+the provider and log the events to a real-time session or a file. The WDK provides a tool called TraceView
+that can be used for just that purpose.
+You can open a Developer’s Command window and run TraceView.exe directly. If you can’t locate it, it’s
+installed by default in a directory such as C:\Program Files (x86)\Windows Kits\10\bin\10.0.22000.0\x64.
+You can copy the executable to the target machine where the driver is supposed to run. When you run
+TraceView.exe, an empty window is shown (figure 5-12).
+
+===== [PDF page 132] =====
+Chapter 5: Debugging and Tracing
+126
+Figure 5-12: The TraceView.exe tool
+Select the File / Create New log Session menu to create a new session. This opens up the dialog shown in
+figure 5-13.
+
+===== [PDF page 133] =====
+Chapter 5: Debugging and Tracing
+127
+Figure 5-13: New session dialog with a new provider
+TraceView provides several methods of locating providers. We can add multiple providers to the same
+session to get information from other components in the system. For now, we’ll add our provider by using
+the Manually Entered Control GUID option, and type in our GUID (figure 5-14):
+
+===== [PDF page 134] =====
+Chapter 5: Debugging and Tracing
+128
+Figure 5-14: Adding a provider GUID manually
+Click OK. A dialog will pop up asking the source for decoding information. Use the default Auto option,
+as trace logging does not require any outside source. You’ll see the single provider in the Create New Log
+Session dialog. Click the Next button. The last step of the wizard allows you to select where the output
+should go to: a real-time session (shown with TraceView), a file, or both (figure 5-15).
+
+===== [PDF page 135] =====
+Chapter 5: Debugging and Tracing
+129
+Figure 5-15: Output selection for a session
+Click Finish. Now you can load/use the driver normally. You should see the output generated in the main
+TraceView window (figure 5-16).
+Figure 5-16: ETW real-time session in action
+You can see the various properties shown in the Message column. When logging to a file, you can open
+the file later with TraceView and see what was logged.
+There are other ways to use TraceView, and other tools to record and view ETW information. You could
+
+===== [PDF page 136] =====
+Chapter 5: Debugging and Tracing
+130
+also write your own tools to parse the ETW log, as the events have semantic information and so can easily
+be analyzed.
+Summary
+In this chapter, we looked at the basics of debugging with WinDbg, as well as tracing activities within the
+driver. Debugging is an essential skill to develop, as software of all kinds, including kernel drivers, may
+have bugs.
+In the next chapter, we’ll delve into some kernel mechanisms we need to get acquainted with, as these
+come up frequently while developing and debugging drivers.

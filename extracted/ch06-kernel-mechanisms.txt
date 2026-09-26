@@ -1,0 +1,1771 @@
+CHAPTER 6: Kernel Mechanisms (PDF pages 137-189)
+
+===== [PDF page 137] =====
+Chapter 6: Kernel Mechanisms
+This chapter discussed various mechanisms the Windows kernel provides. Some of these are directly useful
+for driver writers. Others are mechanisms that a driver developer needs to understand as it helps with
+debugging and general understanding of activities in the system.
+In this chapter:
+• Interrupt Request Level
+• Deferred Procedure Calls
+• Asynchronous Procedure Calls
+• Structured Exception Handling
+• System Crash
+• Thread Synchronization
+• High IRQL Synchronization
+• Work Items
+Interrupt Request Level (IRQL)
+In chapter 1, we discussed threads and thread priorities. These priorities are taken into consideration when
+more threads want to execute than there are available processors. At the same time, hardware devices
+need to notify the system that something requires attention. A simple example is an I/O operation that is
+carried out by a disk drive. Once the operation completes, the disk drive notifies completion by requesting
+an interrupt. This interrupt is connected to an Interrupt Controller hardware that then sends the request
+to a processor for handling. The next question is, which thread should execute the associated Interrupt
+Service Routine (ISR)?
+Every hardware interrupt is associated with a priority, called Interrupt Request Level (IRQL) (not to be
+confused with an interrupt physical line known as IRQ), determined by the HAL. Each processor’s context
+has its own IRQL, just like any register. IRQLs may or may not be implemented by the CPU hardware, but
+this is essentially unimportant. IRQL should be treated just like any other CPU register.
+The basic rule is that a processor executes the code with the highest IRQL. For example, if a CPU’s IRQL is
+zero at some point, and an interrupt with an associated IRQL of 5 comes in, it will save its state (context) in
+the current thread’s kernel stack, raise its IRQL to 5 and then execute the ISR associated with the interrupt.
+Once the ISR completes, the IRQL will drop to its previous level, resuming the previously executed code
+as though the interrupt never happened. While the ISR is executing, other interrupts coming in with an
+
+===== [PDF page 138] =====
+Chapter 6: Kernel Mechanisms
+132
+IRQL of 5 or less cannot interrupt this processor. If, on the other hand, the IRQL of the new interrupt is
+above 5, the CPU will save its state again, raise IRQL to the new level, execute the second ISR associated
+with the second interrupt and when completed, will drop back to IRQL 5, restore its state and continue
+executing the original ISR. Essentially, raising IRQL blocks code with equal or lower IRQL temporarily.
+The basic sequence of events when an interrupt occurs is depicted in figure 6-1. Figure 6-2 shows what
+interrupt nesting looks like.
+Figure 6-1: Basic interrupt dispatching
+
+===== [PDF page 139] =====
+Chapter 6: Kernel Mechanisms
+133
+Figure 6-2: Nested interrupts
+An important fact for the depicted scenarios in figures 6-1 and 6-2 is that execution of all ISRs is done
+by the same thread - which got interrupted in the first place. Windows does not have a special thread
+to handle interrupts; they are handled by whatever thread was running at that time on the interrupted
+processor. As we’ll soon discover, context switching is not possible when the IRQL of the processor is 2 or
+higher, so there is no way another thread can sneak in while these ISRs execute.
+The interrupted thread does not get its quantum reduced because of these “interruptions”. It’s not its
+fault, so to speak.
+When user-mode code is executing, the IRQL is always zero. This is one reason why the term IRQL is not
+mentioned in any user-mode documentation - it’s always zero and cannot be changed. Most kernel-mode
+code runs with IRQL zero as well. It’s possible, however, in kernel mode, to raise the IRQL on the current
+processor.
+The important IRQLs are described below:
+• PASSIVE_LEVEL in WDK (0) - this is the “normal” IRQL for a CPU. User-mode code always runs
+at this level. Thread scheduling working normally, as described in chapter 1.
+• APC_LEVEL (1) - used for special kernel APCs (Asynchronous Procedure Calls will be discussed later
+in this chapter). Thread scheduling works normally.
+• DISPATCH_LEVEL (2) - this is where things change radically. The scheduler cannot wake up on this
+CPU. Paged memory access is not allowed - such access causes a system crash. Since the scheduler
+cannot interfere, waiting on kernel objects is not allowed (causes a system crash if used).
+• Device IRQL - a range of levels used for hardware interrupts (3 to 11 on x64/ARM/ARM64, 3 to 26
+on x86). All rules from IRQL 2 apply here as well.
+
+===== [PDF page 140] =====
+Chapter 6: Kernel Mechanisms
+134
+• Highest level (HIGH_LEVEL) - this is the highest IRQL, masking all interrupts. Used by some APIs
+dealing with linked list manipulation. The actual values are 15 (x64/ARM/ARM64) and 31 (x86).
+When a processor’s IRQL is raised to 2 or higher (for whatever reason), certain restrictions apply on the
+executing code:
+• Accessing memory not in physical memory is fatal and causes a system crash. This means accessing
+data from non-paged pool is always safe, whereas accessing data from paged pool or from user-
+supplied buffers is not safe and should be avoided.
+• Waiting on any kernel object (e.g. mutex or event) causes a system crash, unless the wait timeout is
+zero, which is still allowed. (we’ll discuss dispatcher object and waiting later in this chapter in the
+Thread Synchronization”* section.)
+These restrictions are due to the fact that the scheduler “runs” at IRQL 2; so if a processor’s IRQL is already
+2 or higher, the scheduler cannot wake up on that processor, so context switches (replacing the running
+thread with another on this CPU) cannot occur. Only higher level interrupts can temporarily divert code
+into an associated ISR, but it’s still the same thread - no context switch can occur; the thread’s context is
+saved, the ISR executes and the thread’s state resumes.
+The current IRQL of a processor can be viewed while debugging with the !irql command.
+An optional CPU number can be specified, which shows the IRQL of that CPU.
+You can view the registered interrupts on a system using the !idt debugger command.
+Raising and Lowering IRQL
+As previously discussed, in user mode the concept of IRQL is not mentioned and there is no way to
+change it. In kernel mode, the IRQL can be raised with the KeRaiseIrql function and lowered back with
+KeLowerIrql. Here is a code snippet that raises the IRQL to DISPATCH_LEVEL (2), and then lowers it
+back after executing some instructions at this IRQL.
+// assuming current IRQL <= DISPATCH_LEVEL
+KIRQL oldIrql;
+// typedefed as UCHAR
+KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
+NT_ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
+// do work at IRQL DISPATCH_LEVEL
+KeLowerIrql(oldIrql);
+If you raise IRQL, make sure you lower it in the same function. It’s too dangerous to return from
+a function with a higher IRQL than it was entered. Also, make sure KeRaiseIrql actually
+raises the IRQL and KeLowerIrql actually lowers it; otherwise, a system crash will follow.
+
+===== [PDF page 141] =====
+Chapter 6: Kernel Mechanisms
+135
+Thread Priorities vs. IRQLs
+IRQL is an attribute of a processor. Priority is an attribute of a thread.
+Thread priorities only have meaning at IRQL < 2. Once an executing thread raised IRQL to 2 or higher,
+its priority does not mean anything anymore - it has theoretically an infinite quantum - it will continue
+execution until it lowers the IRQL to below 2.
+Naturally, spending a lot of time at IRQL >= 2 is not a good thing; user mode code is not running for sure.
+This is just one reason there are severe restrictions on what executing code can do at these levels.
+Task Manager shows the amount of CPU time spent in IRQL 2 or higher using a pseudo-process called
+System Interrupts; Process Explorer calls it Interrupts. Figure 6-3 shows a screenshot from Task Manager
+and figure 6-4 shows the same information in Process Explorer.
+Figure 6-3: IRQL 2+ CPU time in Task Manager
+Figure 6-4: IRQL 2+ CPU time in Process Explorer
+Deferred Procedure Calls
+Figure 6-5 shows a typical sequence of events when a client invokes some I/O operation. In this figure,
+a user mode thread opens a handle to a file, and issues a read operation using the ReadFile function.
+Since the thread can make an asynchronous call, it regains control almost immediately and can do other
+work. The driver receiving this request, calls the file system driver (e.g. NTFS), which may call other
+drivers below it, until the request reaches the disk driver, which initiates the operation on the actual disk
+hardware. At that point, no code needs to execute, since the hardware “does its thing”.
+When the hardware is done with the read operation, it issues an interrupt. This causes the Interrupt Service
+Routine associated with the interrupt to execute at Device IRQL (note that the thread handling the request
+is arbitrary, since the interrupt arrives asynchronously). A typical ISR accesses the device’s hardware to
+get the result of the operation. Its final act should be to complete the initial request.
+
+===== [PDF page 142] =====
+Chapter 6: Kernel Mechanisms
+136
+Figure 6-5: Typical I/O request processing (part 1)
+As we’ve seen in chapter 4, completing a request is done by calling IoCompleteRequest. The problem
+is that the documentation states this function can only be called at IRQL <= DISPATCH_LEVEL (2). This
+means the ISR cannot call IoCompleteRequest or it will crash the system. So what is the ISR to do?
+You may wonder why is there such a restriction. One of the reasons has to do with the work
+done by IoCompleteRequest. We’ll discuss this in more detail in the next chapter, but the
+bottom line is that this function is relatively expensive. If the call would have been allowed,
+that would mean the ISR will take substantially longer to execute, and since it executes in a
+high IRQL, it will mask off other interrupts for a longer period of time.
+The mechanism that allows the ISR to call IoCompleteRequest (and other functions with similar
+limitations) as soon as possible is using a Deferred Procedure Call (DPC). A DPC is an object encapsulating
+a function that is to be called at IRQL DISPATCH_LEVEL. At this IRQL, calling IoCompleteRequest is
+permitted.
+You may wonder why does the ISR not simply lower the current IRQL to DISPATCH_LEVEL,
+call IoCompleteRequest, and then raise the IRQL back to its original value. This can cause
+a deadlock. We’ll discuss the reason for that later in this chapter in the section Spin Locks.
+
+===== [PDF page 143] =====
+Chapter 6: Kernel Mechanisms
+137
+The driver which registered the ISR prepares a DPC in advance, by allocating a KDPC structure from non-
+paged pool and initializing it with a callback function using KeInitializeDpc. Then, when the ISR is
+called, just before exiting the function, the ISR requests the DPC to execute as soon as possible by queuing
+it using KeInsertQueueDpc. When the DPC function executes, it calls IoCompleteRequest. So the
+DPC serves as a compromise - it’s running at IRQL DISPATCH_LEVEL, meaning no scheduling can occur,
+no paged memory access, etc. but it’s not high enough to prevent hardware interrupts from coming in and
+being served on the same processor.
+Every processor on the system has its own queue of DPCs. By default, KeInsertQueueDpc queues the
+DPC to the current processor’s DPC queue. When the ISR returns, before the IRQL can drop back to zero, a
+check is made to see whether DPCs exist in the processor’s queue. If there are, the processor drops to IRQL
+DISPATCH_LEVEL (2) and then processes the DPCs in the queue in a First In First Out (FIFO) manner,
+calling the respective functions, until the queue is empty. Only then can the processor’s IRQL drop to zero,
+and resume executing the original code that was disturbed at the time the interrupt arrived.
+DPCs can be customized in some ways. Check out the docs for the functions
+KeSetImportantceDpc and KeSetTargetProcessorDpc.
+Figure 6-6 augments figure 6-5 with the DPC routine execution.
+
+===== [PDF page 144] =====
+Chapter 6: Kernel Mechanisms
+138
+Figure 6-6: Typical I/O request processing (part 2)
+Using DPC with a Timer
+DPCs were originally created for use by ISRs. However, there are other mechanisms in the kernel that
+utilize DPCs.
+One such use is with a kernel timer. A kernel timer, represented by the KTIMER structure allows setting
+up a timer to expire some time in the future, based on a relative interval or absolute time. This timer is
+a dispatcher object and so can be waited upon with KeWaitForSingleObject (discussed later in this
+chapter in the section “Synchronization”). Although waiting is possible, it’s inconvenient for a timer. A
+simpler approach is to call some callback when the timer expires. This is exactly what the kernel timer
+provides using a DPC as its callback.
+The following code snippet shows how to configure a timer and associate it with a DPC. When the timer
+expires, the DPC is inserted into a CPU’s DPC queue and so executes as soon as possible. Using a DPC is
+
+===== [PDF page 145] =====
+Chapter 6: Kernel Mechanisms
+139
+more powerful than a zero IRQL based callback, since it is guaranteed to execute before any user mode
+code (and most kernel mode code).
+KTIMER Timer;
+KDPC TimerDpc;
+void InitializeAndStartTimer(ULONG msec) {
+KeInitializeTimer(&Timer);
+KeInitializeDpc(&TimerDpc,
+OnTimerExpired,
+// callback function
+nullptr);
+// passed to callback as "context"
+// relative interval is in 100nsec units (and must be negative)
+// convert to msec by multiplying by 10000
+LARGE_INTEGER interval;
+interval.QuadPart = -10000LL * msec;
+KeSetTimer(&Timer, interval, &TimerDpc);
+}
+void OnTimerExpired(KDPC* Dpc, PVOID context, PVOID, PVOID) {
+UNREFERENCED_PARAMETER(Dpc);
+UNREFERENCED_PARAMETER(context);
+NT_ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
+// handle timer expiration
+}
+Asynchronous Procedure Calls
+We’ve seen in the previous section that DPCs are objects encapsulating a function to be called at IRQL
+DISPATCH_LEVEL. The calling thread does not matter, as far as DPCs are concerned.
+Asynchronous Procedure Calls (APCs) are also data structures that encapsulate a function to be called. But
+contrary to a DPC, an APC is targeted towards a particular thread, so only that thread can execute the
+function. This means each thread has an APC queue associated with it.
+There are three types of APCs:
+• User mode APCs - these execute in user mode at IRQL PASSIVE_LEVEL only when the thread
+goes into alertable state. This is typically accomplished by calling an API such as SleepEx,
+WaitForSingleObjectEx, WaitForMultipleObjectsEx and similar APIs. The last argument
+to these functions can be set to TRUE to put the thread in alertable state. In this state it looks at its
+APC queue, and if not empty - the APCs now execute until the queue is empty.
+
+===== [PDF page 146] =====
+Chapter 6: Kernel Mechanisms
+140
+• Normal kernel-mode APCs - these execute in kernel mode at IRQL PASSIVE_LEVEL and preempt
+user-mode code (and user-mode APCs).
+• Special kernel APCs - these execute in kernel mode at IRQL APC_LEVEL (1) and preempt user-
+mode code, normal kernel APCs, and user-mode APCs. These APCs are used by the I/O manager to
+complete I/O operations as will be discussed in the next chapter.
+The APC API is undocumented in kernel mode (but has been reversed engineered enough to allow usage
+if desired).
+User-mode can use (user mode) APCs by calling certain APIs. For example, calling
+ReadFileEx or WriteFileEx start an asynchronous I/O operation. When the operation
+completes, a user-mode APC is attached to the calling thread. This APC will execute when
+the thread enters an alertable state as described earlier. Another useful function in user mode
+to explicitly generate an APC is QueueUserAPC. Check out the Windows API documentation
+for more information.
+Critical Regions and Guarded Regions
+A Critical Region prevents user mode and normal kernel APCs from executing (special kernel APCs
+can still execute). A thread enters a critical region with KeEnterCriticalRegion and leaves it with
+KeLeaveCriticalRegion. Some functions in the kernel require being inside a critical region, especially
+when working with executive resources (see the section “Executive Resources” later in this chapter).
+A Guarded Region prevents all APCs from executing. Call KeEnterGuardedRegion to enter a guarded
+region and KeLeaveGuardedRegion to leave it. Recursive calls to KeEnterGuardedRegion must be
+matched with the same number of calls to KeLeaveGuardedRegion.
+Raising the IRQL to APC_LEVEL disables delivery of all APCs.
+Write RAII wrappers for entering/leaving critical and guarded regions.
+Structured Exception Handling
+An exception is an event that occurs because of a certain instruction that did something that caused the
+processor to raise an error. Exceptions are in some ways similar to interrupts, the main difference being
+that an exception is synchronous and technically reproducible under the same conditions, whereas an
+interrupt is asynchronous and can arrive at any time. Examples of exceptions include division by zero,
+breakpoint, page fault, stack overflow and invalid instruction.
+
+===== [PDF page 147] =====
+Chapter 6: Kernel Mechanisms
+141
+If an exception occurs, the kernel catches this and allows code to handle the exception, if possible. This
+mechanism is called Structured Exception Handling (SEH) and is available for user-mode code as well as
+kernel-mode code.
+The kernel exception handlers are called based on the Interrupt Dispatch Table (IDT), the same one holding
+mapping between interrupt vectors and ISRs. Using a kernel debugger, the !idt command shows all these
+mappings. The low numbered interrupt vectors are in fact exception handlers. Here’s a sample output from
+this command:
+lkd> !idt
+Dumping IDT: fffff8011d941000
+00: fffff8011dd6c100 nt!KiDivideErrorFaultShadow
+01: fffff8011dd6c180 nt!KiDebugTrapOrFaultShadow
+Stack = 0xFFFFF8011D9459D0
+02: fffff8011dd6c200 nt!KiNmiInterruptShadow
+Stack = 0xFFFFF8011D9457D0
+03: fffff8011dd6c280 nt!KiBreakpointTrapShadow
+04: fffff8011dd6c300 nt!KiOverflowTrapShadow
+05: fffff8011dd6c380 nt!KiBoundFaultShadow
+06: fffff8011dd6c400 nt!KiInvalidOpcodeFaultShadow
+07: fffff8011dd6c480 nt!KiNpxNotAvailableFaultShadow
+08: fffff8011dd6c500 nt!KiDoubleFaultAbortShadow
+Stack = 0xFFFFF8011D9453D0
+09: fffff8011dd6c580 nt!KiNpxSegmentOverrunAbortShadow
+0a: fffff8011dd6c600 nt!KiInvalidTssFaultShadow
+0b: fffff8011dd6c680 nt!KiSegmentNotPresentFaultShadow
+0c: fffff8011dd6c700 nt!KiStackFaultShadow
+0d: fffff8011dd6c780 nt!KiGeneralProtectionFaultShadow
+0e: fffff8011dd6c800 nt!KiPageFaultShadow
+10: fffff8011dd6c880 nt!KiFloatingErrorFaultShadow
+11: fffff8011dd6c900 nt!KiAlignmentFaultShadow
+(truncated)
+Note the function names - most are very descriptive. These entries are connected to Intel/AMD (in this
+example) faults. Some common examples of exceptions include:
+• Division by zero (0)
+• Breakpoint (3) - the kernel handles this transparently, passing control to an attached debugger (if
+any).
+• Invalid opcode (6) - this fault is raised by the CPU if it encounters an unknown instruction.
+• Page fault (14) - this fault is raised by the CPU if the page table entry used for translating virtual to
+physical addresses has the Valid bit set to zero, indicating (as far as the CPU is concerned) that the
+page is not resident in physical memory.
+
+===== [PDF page 148] =====
+Chapter 6: Kernel Mechanisms
+142
+Some other exceptions are raised by the kernel as a result of a previous CPU fault. For example, if a page
+fault is raised, the Memory Manager’s page fault handler will try to locate the page that is not resident in
+RAM. If the page happens not to exist at all, the Memory Manager will raise an Access Violation exception.
+Once an exception is raised, the kernel searches the function where the exception occurred for a handler
+(except for some exceptions which it handles transparently, such as Breakpoint (3)). If not found, it will
+search up the call stack, until such handler is found. If the call stack is exhausted, the system will crash.
+How can a driver handle these types of exceptions? Microsoft added four keywords to the C language to
+allow developers to handle such exceptions, as well as have code execute no matter what. Table 6-1 shows
+the added keywords with a brief description.
+Table 6-1: Keywords for working with SEH
+Keyword
+Description
+__try
+Starts a block of code where exceptions may occur.
+__except
+Indicates if an exception is handled, and provides the handling code if it is.
+__finally
+Unrelated to exceptions directly. Provides code that is guaranteed to execute no matter what -
+whether the __try block is exited normally, with a return statement, or because of an
+exception.
+__leave
+Provides an optimized mechanism to jump to the __finally block from somewhere within a
+__try block.
+The valid combination of keywords is __try/__except and __try/__finally. However, these can be
+combined by using nesting to any level.
+These same keywords work in user mode as well, in much the same way.
+Using __try/__except
+In chapter 4, we implemented a driver that accesses a user-mode buffer to get data needed for the driver’s
+operation. We used a direct pointer to the user’s buffer. However, this is not guaranteed to be safe. For
+example, the user-mode code (say from another thread) could free the buffer, just before the driver accesses
+it. In such a case, the driver would cause a system crash, essentially because of a user’s error (or malicious
+intent). Since user data should never be trusted, such access should be wrapped in a __try/__except
+block to make sure a bad buffer does not crash the driver.
+Here is the important part of a revised IRP_MJ_WRITE handler using an exception handler:
+
+===== [PDF page 149] =====
+Chapter 6: Kernel Mechanisms
+143
+do {
+if (irpSp->Parameters.Write.Length < sizeof(ThreadData)) {
+status = STATUS_BUFFER_TOO_SMALL;
+break;
+}
+auto data = (ThreadData*)Irp->UserBuffer;
+if (data == nullptr) {
+status = STATUS_INVALID_PARAMETER;
+break;
+}
+__try {
+if (data->Priority < 1 || data->Priority > 31) {
+status = STATUS_INVALID_PARAMETER;
+break;
+}
+PETHREAD Thread;
+status = PsLookupThreadByThreadId(
+ULongToHandle(data->ThreadId), &Thread);
+if (!NT_SUCCESS(status))
+break;
+KeSetPriorityThread((PKTHREAD)Thread, data->Priority);
+ObDereferenceObject(Thread);
+KdPrint(("Thread Priority change for %d to %d succeeded!\n",
+data->ThreadId, data->Priority));
+break;
+}
+__except (EXCEPTION_EXECUTE_HANDLER) {
+// probably something wrong with the buffer
+status = STATUS_ACCESS_VIOLATION;
+}
+} while(false);
+Placing EXCEPTION_EXECUTE_HANDLER in __except says that any exception is to be handled. We can
+be more selective by calling GetExceptionCode and looking at the actual exception. If we don’t expect
+this, we can tell the kernel to continue looking for handlers up the call stack:
+__except (GetExceptionCode() == STATUS_ACCESS_VIOLATION
+? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+// handle exception
+}
+Does all this mean that the driver can catch any and all exceptions? If so, the driver will never cause a
+system crash. Fortunately (or unfortunately, depending on your perspective), this is not the case. Access
+
+===== [PDF page 150] =====
+Chapter 6: Kernel Mechanisms
+144
+violation, for example, is something that can only be caught if the violated address is in user space. If it’s
+in kernel space, it cannot be caught and still cause a system crash. This makes sense, since something bad
+has happened and the kernel will not let the driver get away with it. User mode addresses, on the other
+hand, are not at the control of the driver, so such exceptions can be caught and handled.
+The SEH mechanism can also be used by drivers (and user-mode code) to raise custom exceptions. The
+kernel provides the generic function ExRaiseStatus to raise any exception and some specific functions
+like ExRaiseAccessViolation:
+void ExRaiseStatus(NTSTATUS Status);
+A driver can also crash the system explicitly if it concludes that something really bad going on, such as data
+being corrupted from underneath the driver. The kernel provides the KeBugCheckEx for this purpose:
+VOID KeBugCheckEx(
+_In_ ULONG BugCheckCode,
+_In_ ULONG_PTR BugCheckParameter1,
+_In_ ULONG_PTR BugCheckParameter2,
+_In_ ULONG_PTR BugCheckParameter3,
+_In_ ULONG_PTR BugCheckParameter4);
+KeBugCheckEx is the normal kernel function that generates a crash. BugCheckCode is the crash code to
+be reported, and the other 4 numbers can provide more details about the crash. If the bugcheck code is one
+of those documented by Microsoft, the meaning of the other 4 numbers must be provided as documented.
+(See the next section System Crash for more details).
+Using __try/__finally
+Using a block of __try and __finally is not directly related to exceptions. This is about making sure
+some piece of code executes no matter what - whether the code exits cleanly or mid-way because of an
+exception. This is similar in concept to the finally keyword popular in some high level languages (e.g.
+Java, C#). Here is a simple example to show the problem:
+void foo() {
+void* p = ExAllocatePoolWithTag(PagedPool, 1024, DRIVER_TAG);
+if(p == nullptr)
+return;
+// do something with p
+ExFreePool(p);
+}
+The above code seems harmless enough. However, there are several issues with it:
+
+===== [PDF page 151] =====
+Chapter 6: Kernel Mechanisms
+145
+• If an exception is thrown between the allocation and the release, a handler in the caller will be
+searched, but the memory will not be freed.
+• If a return statement is used in some conditional between the allocation and release, the buffer
+will not be freed. This requires the code to be careful to make sure all exit points from the function
+pass through the code freeing the buffer.
+The second bullet can be implemented with careful coding, but is a burden best avoided. The first bullet
+cannot be handled with standard coding techniques. This is where __try/__finally come in. Using
+this combination, we can make sure the buffer is freed no matter what happens in the __try block:
+void foo() {
+void* p = ExAllocatePoolWithTag(PagedPool, 1024, DRIVER_TAG);
+if(p == nullptr)
+return;
+__try {
+// do something with p
+}
+__finally {
+// called no matter what
+ExFreePool(p);
+}
+}
+With the above code in place, even if return statements appear within the __try body, the __finally
+code will be called before actually returning from the function. If some exception occurs, the __finally
+block runs first before the kernel searches up the call stack for possible handlers.
+__try/__finally is useful not just with memory allocations, but also with other resources, where some
+acquisition and release need to take place. One common example is when synchronizing threads accessing
+some shared data. Here is an example of acquiring and releasing a fast mutex (fast mutex and other
+synchronization primitives are described later in this chapter):
+FAST_MUTEX MyMutex;
+void foo() {
+ExAcquireFastMutex(&MyMutex);
+__try {
+// do work while the fast mutex is held
+}
+__finally {
+ExReleaseFastMutex(&MyMutex);
+}
+}
+
+===== [PDF page 152] =====
+Chapter 6: Kernel Mechanisms
+146
+Using C++ RAII Instead of __try / __finally
+Although the preceding examples with __try/__finally work, they are not terribly convenient. Using
+C++ we can build RAII wrappers that do the right thing without the need to use __try/__finally. C++
+does not have a finally keyword like C# or Java, but it doesn’t need one - it has destructors.
+Here is a very simple, bare minimum, example that manages a buffer allocation with a RAII class:
+template<typename T = void>
+struct kunique_ptr {
+explicit kunique_ptr(T* p = nullptr) : _p(p) {}
+~kunique_ptr() {
+if (_p)
+ExFreePool(_p);
+}
+T* operator->() const {
+return _p;
+}
+T& operator*() const {
+return *_p;
+}
+private:
+T* _p;
+};
+The class uses templates to allow working easily with any type of data. An example usage follows:
+struct MyData {
+ULONG Data1;
+HANDLE Data2;
+};
+void foo() {
+// take charge of the allocation
+kunique_ptr<MyData> data((MyData*)ExAllocatePool(PagedPool, sizeof(MyData))\
+);
+// use the pointer
+data->Data1 = 10;
+// when the object goes out of scope, the destructor frees the buffer
+}
+
+===== [PDF page 153] =====
+Chapter 6: Kernel Mechanisms
+147
+If you don’t normally use C++ as your primary programming language, you may find the above code
+confusing. You can continue working with __try/__finally, but I recommend getting acquainted
+with this type of code. In any case, even if you struggle with the implementation of kunique_ptr
+above, you can still use it without needing to understand every little detail.
+The kunique_ptr type presented above is a bare minimum. You should also remove the copy constructor
+and copy assignment, and allow move copy and assignment (C++ 11 and later, for ownership transfer). Here
+is a more complete implementation:
+template<typename T = void>
+struct kunique_ptr {
+explicit kunique_ptr(T* p = nullptr) : _p(p) {}
+// remove copy ctor and copy = (single owner)
+kunique_ptr(const kunique_ptr&) = delete;
+kunique_ptr& operator=(const kunique_ptr&) = delete;
+// allow ownership transfer
+kunique_ptr(kunique_ptr&& other) : _p(other._p) {
+other._p = nullptr;
+}
+kunique_ptr& operator=(kunique_ptr&& other) {
+if (&other != this) {
+Release();
+_p = other._p;
+other._p = nullptr;
+}
+return *this;
+}
+~kunique_ptr() {
+Release();
+}
+operator bool() const {
+return _p != nullptr;
+}
+T* operator->() const {
+
+===== [PDF page 154] =====
+Chapter 6: Kernel Mechanisms
+148
+return _p;
+}
+T& operator*() const {
+return *_p;
+}
+void Release() {
+if (_p)
+ExFreePool(_p);
+}
+private:
+T* _p;
+};
+We’ll build other RAII wrappers for synchronization primitives later in this chapter.
+Using C++ RAII wrappers has one missing piece - if an exception occurs, the destructor will not
+be called, so a leak of some sort occurs. The reason this does not work (as it does in user-mode),
+is the lack of a C++ runtime and the current inability of the compiler to set up elaborate code
+with __try/__finally to mimic this effect. Even so, it’s still very useful, as in many cases
+exceptions are not expected, and even if they are, no handler exists in the driver for that and
+the system should probably crash anyway.
+System Crash
+As we already know, if an unhandled exception occurs in kernel mode, the system crashes, typically with
+the “Blue Screen of Death” (BSOD) showing its face (on Windows 8+, that’s literally a face - saddy or
+frowny - the inverse of smiley). In this section, we’ll discuss what happens when the system crashes and
+how to deal with it.
+The system crash has many names, all meaning the same thing - “Blue screen of Death”, “System failure”,
+“Bugcheck”, “Stop error”. The BSOD is not some punishment, as may seem at first, but a protection
+mechanism. If kernel code, which is supposed to be trusted, did something bad, stopping everything
+is probably the safest approach, as perhaps letting the code continue roaming around may result in an
+unbootable system if some important files or Registry data is corrupted.
+Recent versions of Windows 10 have some alternate colors for when the system crashes. Green is used
+for insider preview builds, and I actually encountered a pink as well (power-related errors).
+
+===== [PDF page 155] =====
+Chapter 6: Kernel Mechanisms
+149
+If the crashed system is connected to a kernel debugger, the debugger will break. This allows examining
+the state of the system before other actions take place.
+The system can be configured to perform some operations if the system crashes. This can be done with the
+System Properties UI on the Advanced tab. Clicking Settings… at the Startup and Recovery section brings
+the Startup and Recovery dialog where the System Failure section shows the available options. Figure 6-7
+shows these two dialogs.
+Figure 6-7: Startup and recovery settings
+If the system crashes, an event entry can be written to the event log. It’s checked by default, and there is
+no good reason to change it. The system is configured to automatically restart; this has been the default
+since Windows 2000.
+The most important setting is the generation of a dump file. The dump file captures the system state at the
+time of the crash, so it can later be analyzed by loading the dump file into the debugger. The type of the
+dump file is important since it determines what information will be present in the dump. The dump is not
+written to the target file at crash time, but instead written to the first page file.
+Only when the system restarts, the kernel notices there is dump information in the page file, and it copies
+the data to the target file. The reason has to do with the fact that at system crash time it may be too
+dangerous to write something to a new file (or overwrite an existing file); the I/O system may not be stable
+enough. The best bet is to write the data to a page file, which is already open anyway. The downside is that
+the page file must be large enough to contain the dump, otherwise the dump file will not be generated.
+The dump file contains physical memory only.
+
+===== [PDF page 156] =====
+Chapter 6: Kernel Mechanisms
+150
+The dump type determines what data would be written and hints at the page file size that may be required.
+Here are the options:
+• Small memory dump (256 KB on Windows 8 and later, 64 KB on older systems) - a very minimal
+dump, containing basic system information and information on the thread that caused the crash.
+Usually this is too little to determine what happened in all but the most trivial cases. The upside is
+that the file is small, so it can be easily moved.
+• Kernel memory dump - this is the default on Windows 7 and earlier versions. This setting captures
+all kernel memory but no user memory. This is usually good enough, since a system crash can only
+be caused by kernel code misbehaving. It’s extremely unlikely that user-mode had anything to do
+with it.
+• Complete memory dump - this provides a dump of all physical memory, user memory and kernel
+memory. This is the most complete information available. The downside is the size of the dump,
+which could be gigantic depending on the size of RAM (the total size of the final file). The obvious
+optimization is not to include unused pages, but Complete Memory Dump does not do that.
+• Automatic memory dump (Windows 8+) - this is the default on Windows 8 and later. This is the
+same as kernel memory dump, but the kernel resizes the page file on boot to a size that guarantees
+with high probability that the page file size would be large enough to contain a kernel dump. This
+is only done if the page file size is specified as “System managed” (the default).
+• Active memory dump (Windows 10+) - this is similar to a complete memory dump, with two
+exceptions. First, unused pages re not written. Second, if the crashed system is hosting guest virtual
+machines, the memory they were using at the time is not captured (as it’s unlikely these have
+anything to do with the host crashing). These optimizations help in reducing the dump file size.
+Crash Dump Information
+Once you have a crash dump in hand, you can open it in WinDbg by selecting File/Open Dump File and
+navigating to the file. The debugger will spew some basic information similar to the following:
+Microsoft (R) Windows Debugger Version 10.0.18317.1001 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+Loading Dump File [C:\Windows\MEMORY.DMP]
+Kernel Bitmap Dump File: Kernel address space is available, User address space \
+may not be available.
+************* Path validation summary **************
+Response
+Time (ms)
+Location
+Deferred
+SRV*c:\Symbols*http://msdl.micro\
+soft.com/download/symbols
+Symbol search path is: SRV*c:\Symbols*http://msdl.microsoft.com/download/symbols
+Executable search path is:
+Windows 10 Kernel Version 18362 MP (4 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS
+
+===== [PDF page 157] =====
+Chapter 6: Kernel Mechanisms
+151
+Built by: 18362.1.amd64fre.19h1_release.190318-1202
+Machine Name:
+Kernel base = 0xfffff803`70abc000 PsLoadedModuleList = 0xfffff803`70eff2d0
+Debug session time: Wed Apr 24 15:36:55.613 2019 (UTC + 3:00)
+System Uptime: 0 days 0:05:38.923
+Loading Kernel Symbols
+....................................Page 2001b5efc too large to be in the dump \
+file.
+Page 20001ebfb too large to be in the dump file.
+...............................
+Loading User Symbols
+PEB is paged out (Peb.Ldr = 00000054`34256018).
+Type ".hh dbgerr001" for detai\
+ls
+Loading unloaded module list
+.............
+For analysis of this file, run !analyze -v
+nt!KeBugCheckEx:
+fffff803`70c78810 48894c2408
+mov
+qword ptr [rsp+8],rcx ss:fffff988`53b\
+0f6b0=000000000000000a
+The debugger suggests running !analyze -v and it’s the most common thing to do at the start of dump
+analysis. Notice the call stack is at KeBugCheckEx, which is the function generating the bugcheck.
+The default logic behind !analyze -v performs basic analysis on the thread that caused the crash and
+shows a few pieces of information related to the crash dump code:
+2: kd> !analyze -v
+*******************************************************************************
+*
+*
+*
+Bugcheck Analysis
+*
+*
+*
+*******************************************************************************
+DRIVER_IRQL_NOT_LESS_OR_EQUAL (d1)
+An attempt was made to access a pageable (or completely invalid) address at an
+interrupt request level (IRQL) that is too high.
+This is usually
+caused by drivers using improper addresses.
+If kernel debugger is available get stack backtrace.
+Arguments:
+Arg1: ffffd907b0dc7660, memory referenced
+Arg2: 0000000000000002, IRQL
+Arg3: 0000000000000000, value 0 = read operation, 1 = write operation
+Arg4: fffff80375261530, address which referenced memory
+
+===== [PDF page 158] =====
+Chapter 6: Kernel Mechanisms
+152
+Debugging Details:
+------------------
+(truncated)
+DUMP_TYPE:
+1
+BUGCHECK_P1: ffffd907b0dc7660
+BUGCHECK_P2: 2
+BUGCHECK_P3: 0
+BUGCHECK_P4: fffff80375261530
+READ_ADDRESS: Unable to get offset of nt!_MI_VISIBLE_STATE.SpecialPool
+Unable to get value of nt!_MI_VISIBLE_STATE.SessionSpecialPool
+ffffd907b0dc7660 Paged pool
+CURRENT_IRQL:
+2
+FAULTING_IP:
+myfault+1530
+fffff803`75261530 8b03
+mov
+eax,dword ptr [rbx]
+(truncated)
+ANALYSIS_VERSION: 10.0.18317.1001 amd64fre
+TRAP_FRAME:
+fffff98853b0f7f0 -- (.trap 0xfffff98853b0f7f0)
+NOTE: The trap frame does not contain all registers.
+Some register values may be zeroed or incorrect.
+rax=0000000000000000 rbx=0000000000000000 rcx=ffffd90797400340
+rdx=0000000000000880 rsi=0000000000000000 rdi=0000000000000000
+rip=fffff80375261530 rsp=fffff98853b0f980 rbp=0000000000000002
+r8=ffffd9079c5cec10
+r9=0000000000000000 r10=ffffd907974002c0
+r11=ffffd907b0dc1650 r12=0000000000000000 r13=0000000000000000
+r14=0000000000000000 r15=0000000000000000
+iopl=0
+nv up ei ng nz na po nc
+myfault+0x1530:
+fffff803`75261530 8b03
+mov
+eax,dword ptr [rbx] ds:00000000`00000\
+000=????????
+Resetting default scope
+
+===== [PDF page 159] =====
+Chapter 6: Kernel Mechanisms
+153
+LAST_CONTROL_TRANSFER:
+from fffff80370c8a469 to fffff80370c78810
+STACK_TEXT:
+fffff988`53b0f6a8 fffff803`70c8a469 : 00000000`0000000a ffffd907`b0dc7660 00000\
+000`00000002 00000000`00000000 : nt!KeBugCheckEx
+fffff988`53b0f6b0 fffff803`70c867a5 : ffff8788`e4604080 ffffff4c`c66c7010 00000\
+000`00000003 00000000`00000880 : nt!KiBugCheckDispatch+0x69
+fffff988`53b0f7f0 fffff803`75261530 : ffffff4c`c66c7000 00000000`00000000 fffff\
+988`53b0f9e0 00000000`00000000 : nt!KiPageFault+0x465
+fffff988`53b0f980 fffff803`75261e2d : fffff988`00000000 00000000`00000000 ffff8\
+788`ec7cf520 00000000`00000000 : myfault+0x1530
+fffff988`53b0f9b0 fffff803`75261f88 : ffffff4c`c66c7010 00000000`000000f0 00000\
+000`00000001 ffffff30`21ea80aa : myfault+0x1e2d
+fffff988`53b0fb00 fffff803`70ae3da9 : ffff8788`e6d8e400 00000000`00000001 00000\
+000`83360018 00000000`00000001 : myfault+0x1f88
+fffff988`53b0fb40 fffff803`710d1dd5 : fffff988`53b0fec0 ffff8788`e6d8e400 00000\
+000`00000001 ffff8788`ecdb6690 : nt!IofCallDriver+0x59
+fffff988`53b0fb80 fffff803`710d172a : ffff8788`00000000 00000000`83360018 00000\
+000`00000000 fffff988`53b0fec0 : nt!IopSynchronousServiceTail+0x1a5
+fffff988`53b0fc20 fffff803`710d1146 : 00000054`344feb28 00000000`00000000 00000\
+000`00000000 00000000`00000000 : nt!IopXxxControlFile+0x5ca
+fffff988`53b0fd60 fffff803`70c89e95 : ffff8788`e4604080 fffff988`53b0fec0 00000\
+054`344feb28 fffff988`569fd630 : nt!NtDeviceIoControlFile+0x56
+fffff988`53b0fdd0 00007ff8`ba39c147 : 00000000`00000000 00000000`00000000 00000\
+000`00000000 00000000`00000000 : nt!KiSystemServiceCopyEnd+0x25
+00000054`344feb48 00000000`00000000 : 00000000`00000000 00000000`00000000 00000\
+000`00000000 00000000`00000000 : 0x00007ff8`ba39c147
+(truncated)
+FOLLOWUP_IP:
+myfault+1530
+fffff803`75261530 8b03
+mov
+eax,dword ptr [rbx]
+FAULT_INSTR_CODE:
+8d48038b
+SYMBOL_STACK_INDEX:
+3
+SYMBOL_NAME:
+myfault+1530
+FOLLOWUP_NAME:
+MachineOwner
+
+===== [PDF page 160] =====
+Chapter 6: Kernel Mechanisms
+154
+MODULE_NAME: myfault
+IMAGE_NAME:
+myfault.sys
+(truncated)
+Every crash dump code can have up to 4 numbers that provide more information about the crash. In this
+case, we can see the code is DRIVER_IRQL_NOT_LESS_OR_EQUAL (0xd1) and the next four numbers
+named Arg1 through Arg4 mean (in order): memory referenced, the IRQL at the time of the call, read vs.
+write operation and the accessing address.
+The command clearly recognizes myfault.sys as the faulting module (driver). That’s because this is an easy
+crash - the culprit is on the call stack as can be seen in the STACK TEXT section above (you can also simply
+use the k command to see it again).
+The !analyze -v command is extensible and it’s possible to add more analysis to that
+command using an extension DLL. You may be able to find such extensions on the web. Consult
+the debugger API documentation for more information on how to add your own analysis code
+to this command.
+More complex crash dumps may show calls from the kernel only on the call stack of the offending thread.
+Before you conclude that you found a bug in the Windows kernel, consider this more likely scenario: A
+driver did something that was not fatal in itself, such as experience a buffer overflow - wrote data beyond
+its allocated buffer, but unfortunately ,the memory following that buffer was allocated by some other
+driver or the kernel, and so nothing bad happened at that time. Some time later, the kernel accessed that
+memory and got bad data and caused a system crash. But the faulting driver is nowhere to be found on
+any call stack; this is much harder to diagnose.
+One way to help diagnose such issues is using Driver Verifier. We’ll look at the basics of Driver
+Verifier in module 12.
+Once you get the crash dump code, it’s helpful to look in the debugger documentation at the
+topic “Bugcheck Code Reference”, where common bugcheck codes are explained more fully
+with typical causes and ideas on what to investigate next.
+Analyzing a Dump File
+A dump file is a snapshot of a system’s memory. Other than that, it’s the same as any other kernel
+debugging session. You just can’t set breakpoints, and certainly cannot use any go command. All other
+commands are available as usual. Commands such as !process, !thread, lm, k can be used normally.
+Here are some other commands and tips:
+• The prompt indicates the current processor. Switching processors can be done with the command
+∼ns where n is the CPU index (it looks like switching threads in user mode).
+
+===== [PDF page 161] =====
+Chapter 6: Kernel Mechanisms
+155
+• The !running command can be used to list the threads that were running on all processors at the
+time of the crash. Adding -t as an option shows the call stack for each thread. Here is an example
+with the above crash dump:
+2: kd> !running -t
+System Processors:
+(000000000000000f)
+Idle Processors:
+(0000000000000002)
+Prcbs
+Current
+(pri) Next
+(pri) Idle
+0
+fffff8036ef3f180
+ffff8788e91cf080 ( 8)
+fffff80371\
+048400
+................
+# Child-SP
+RetAddr
+Call Site
+00 00000094`ed6ee8a0 00000000`00000000 0x00007ff8`b74c4b57
+2
+ffffb000c1944180
+ffff8788e4604080 (12)
+ffffb000c1\
+955140
+................
+# Child-SP
+RetAddr
+Call Site
+00 fffff988`53b0f6a8 fffff803`70c8a469 nt!KeBugCheckEx
+01 fffff988`53b0f6b0 fffff803`70c867a5 nt!KiBugCheckDispatch+0x69
+02 fffff988`53b0f7f0 fffff803`75261530 nt!KiPageFault+0x465
+03 fffff988`53b0f980 fffff803`75261e2d myfault+0x1530
+04 fffff988`53b0f9b0 fffff803`75261f88 myfault+0x1e2d
+05 fffff988`53b0fb00 fffff803`70ae3da9 myfault+0x1f88
+06 fffff988`53b0fb40 fffff803`710d1dd5 nt!IofCallDriver+0x59
+07 fffff988`53b0fb80 fffff803`710d172a nt!IopSynchronousServiceTail+0x1a5
+08 fffff988`53b0fc20 fffff803`710d1146 nt!IopXxxControlFile+0x5ca
+09 fffff988`53b0fd60 fffff803`70c89e95 nt!NtDeviceIoControlFile+0x56
+0a fffff988`53b0fdd0 00007ff8`ba39c147 nt!KiSystemServiceCopyEnd+0x25
+0b 00000054`344feb48 00000000`00000000 0x00007ff8`ba39c147
+3
+ffffb000c1c80180
+ffff8788e917e0c0 ( 5)
+ffffb000c1\
+c91140
+................
+# Child-SP
+RetAddr
+Call Site
+00 fffff988`5683ec38 fffff803`70ae3da9 Ntfs!NtfsFsdClose
+01 fffff988`5683ec40 fffff803`702bb5de nt!IofCallDriver+0x59
+02 fffff988`5683ec80 fffff803`702b9f16 FLTMGR!FltpLegacyProcessingAfterPreCallb\
+acksCompleted+0x15e
+03 fffff988`5683ed00 fffff803`70ae3da9 FLTMGR!FltpDispatch+0xb6
+
+===== [PDF page 162] =====
+Chapter 6: Kernel Mechanisms
+156
+04 fffff988`5683ed60 fffff803`710cfe4d nt!IofCallDriver+0x59
+05 fffff988`5683eda0 fffff803`710de470 nt!IopDeleteFile+0x12d
+06 fffff988`5683ee20 fffff803`70aea9d4 nt!ObpRemoveObjectRoutine+0x80
+07 fffff988`5683ee80 fffff803`723391f5 nt!ObfDereferenceObject+0xa4
+08 fffff988`5683eec0 fffff803`72218ca7 Ntfs!NtfsDeleteInternalAttributeStream+0\
+x111
+09 fffff988`5683ef00 fffff803`722ff7cf Ntfs!NtfsDecrementCleanupCounts+0x147
+0a fffff988`5683ef40 fffff803`722fe87d Ntfs!NtfsCommonCleanup+0xadf
+0b fffff988`5683f390 fffff803`70ae3da9 Ntfs!NtfsFsdCleanup+0x1ad
+0c fffff988`5683f6e0 fffff803`702bb5de nt!IofCallDriver+0x59
+0d fffff988`5683f720 fffff803`702b9f16 FLTMGR!FltpLegacyProcessingAfterPreCallb\
+acksCompleted+0x15e
+0e fffff988`5683f7a0 fffff803`70ae3da9 FLTMGR!FltpDispatch+0xb6
+0f fffff988`5683f800 fffff803`710ccc38 nt!IofCallDriver+0x59
+10 fffff988`5683f840 fffff803`710d4bf8 nt!IopCloseFile+0x188
+11 fffff988`5683f8d0 fffff803`710d9f3e nt!ObCloseHandleTableEntry+0x278
+12 fffff988`5683fa10 fffff803`70c89e95 nt!NtClose+0xde
+13 fffff988`5683fa80 00007ff8`ba39c247 nt!KiSystemServiceCopyEnd+0x25
+14 000000b5`aacf9df8 00000000`00000000 0x00007ff8`ba39c247
+The command gives a pretty good idea of what was going on at the time of the crash.
+• The !stacks command lists all thread stacks for all threads by default. A more useful variant is a
+search string that lists only threads where a module or function containing this string appears. This
+allows locating driver’s code throughout the system (because it may not have been running at the
+time of the crash, but it’s on some thread’s call stack). Here’s an example for the above dump:
+2: kd> !stacks
+Proc.Thread
+.Thread
+Ticks
+ThreadState Blocker
+[fffff803710459c0 Idle]
+0.000000
+fffff80371048400 0000003 RUNNING
+nt!KiIdleLoop+0x15e
+0.000000
+ffffb000c17b1140 0000ed9 RUNNING
+hal!HalProcessorIdle+0xf
+0.000000
+ffffb000c1955140 0000b6e RUNNING
+nt!KiIdleLoop+0x15e
+0.000000
+ffffb000c1c91140 000012b RUNNING
+nt!KiIdleLoop+0x15e
+[ffff8788d6a81300 System]
+4.000018
+ffff8788d6b8a080 0005483 Blocked
+nt!PopFxEmergencyWorker+0x3e
+4.00001c
+ffff8788d6bc5140 0000982 Blocked
+nt!ExpWorkQueueManagerThread+0x\
+127
+4.000020
+ffff8788d6bc9140 000085a Blocked
+nt!KeRemovePriQueue+0x25c
+(truncated)
+
+===== [PDF page 163] =====
+Chapter 6: Kernel Mechanisms
+157
+2: kd> !stacks 0 myfault
+Proc.Thread
+.Thread
+Ticks
+ThreadState Blocker
+[fffff803710459c0 Idle]
+[ffff8788d6a81300 System]
+(truncated)
+[ffff8788e99070c0 notmyfault64.exe]
+af4.00160c
+ffff8788e4604080 0000006 RUNNING
+nt!KeBugCheckEx
+(truncated)
+The address next to each line is the thread’s ETHREAD address that can be fed to the !thread command.
+System Hang
+A system crash is the most common type of dump that is typically investigated. However, there is yet
+another type of dump that you may need to work with: a hung system. A hung system is a non-responsive
+or near non-responsive system. Things seem to be halted or deadlocked in some way - the system does
+not crash, so the first issue to deal with is how to get a dump of the system.
+A dump file contains some system state, it does not have to be related to a crash or any other bad state.
+There are tools (including the kernel debugger) that can generate a dump file at any time.
+If the system is still responsive to some extent, the Sysinternals NotMyFault tool can force a system crash
+and so force a dump file to be generated (this is in fact the way the dump in the previous section was
+generated). Figure 6-8 shows a screenshot of NotMyFault. Selecting the first (default) option and clicking
+Crash immediately crashes the system and will generate a dump file (if configured to do so).
+
+===== [PDF page 164] =====
+Chapter 6: Kernel Mechanisms
+158
+Figure 6-8: NotMyFault
+NotMyFault uses a driver, myfault.sys that is actually responsible for the crash.
+NotMyFault has 32 and 64 bit versions (the later file name ends with “64”). Remember to use
+the correct one for the system at hand, otherwise its driver will fail to load.
+If the system is completely unresponsive, and you can attach a kernel debugger (the target was configured
+for debugging), then debug normally or generate a dump file using the .dump command.
+If the system is unresponsive and a kernel debugger cannot be attached, it’s possible to generate a crash
+manually if configured in the Registry beforehand (this assumes the hang was somehow expected). When
+a certain key combination is detected, the keyboard driver will generate a crash. Consult this link¹ to get
+the full details. The crash code in this case is 0xe2 (MANUALLY_INITIATED_CRASH).
+¹https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/forcing-a-system-crash-from-the-keyboard
+
+===== [PDF page 165] =====
+Chapter 6: Kernel Mechanisms
+159
+Thread Synchronization
+Threads sometimes need to coordinate work. A canonical example is a driver using a linked list to gather
+data items. The driver can be invoked by multiple clients, coming from many threads in one or more
+processes. This means manipulating the linked list must be done atomically, so it’s not corrupted. If multiple
+threads access the same memory where at least one is a writer (making changes), this is referred to as a
+data race. If a data race occurs, all bets are off and anything can happen. Typically, within a driver, a
+system crash occurs sooner or later; data corruption is practically guaranteed.
+In such a scenario, it’s essential that while one thread manipulates the linked list, all other threads back
+off the linked list, and wait in some way for the first thread to finish its work. Only then another thread
+(just one) can manipulate the list. This is an example of thread synchronization.
+The kernel provides several primitives that help in accomplishing proper synchronization to protect
+data from concurrent access. The following discussed various primitives and techniques for thread
+synchronization.
+Interlocked Operations
+The Interlocked set of functions provide convenient operations that are performed atomically by utilizing
+the hardware, which means no software objects are involved. If using these functions gets the job done,
+then they should be used, as these are as efficient as they can possibly be.
+Technically, these Interlocked-family of functions are called compiler intrinsincs, as they are
+instructions to the processor, disguised as functions.
+The same functions (intrinsics) are available in user-mode as well.
+A simple example is incrementing an integer by one. Generally, this is not an atomic operation. If two (or
+more) threads try to perform this at the same time on the same memory location, it’s possible (and likely)
+some of the increments will be lost. Figure 6-9 shows a simple scenario where incrementing a value by 1
+done from two threads ends up with result of 1 instead of 2.
+
+===== [PDF page 166] =====
+Chapter 6: Kernel Mechanisms
+160
+Figure 6-9: Concurrent increment
+The example in figure 6-9 is extremely simplistic. With real CPUs there are other effects to
+consider, especially caching, which makes the shown scenario even more likely. CPU caching,
+store buffers, and other aspects of modern CPUs are non-trivial topics, well beyond the scope
+of this book.
+Table 6-2 lists some of the Interlocked functions available for drivers use.
+Table 6-2: Some Interlocked functions
+Function
+Description
+InterlockedIncrement /
+InterlockedIncrement16 /
+InterlockedIncrement64
+Atomically increment a 32/16/64 bit integer by one
+InterlockedDecrement / 16 / 64
+Atomically decrement a 32/16/64 bit integer by one.
+InterlockedAdd / InterlockedAdd64
+Atomically add one 32/64 bit integer to a variable.
+InterlockedExchange / 8 / 16 / 64
+Atomically exchange two 32/8/16/64 bit values.
+InterlockedCompareExchange / 64 / 128
+Atomically compare a variable with a value. If equal
+exchange with the provided value and return TRUE;
+otherwise, place the current value in the variable and
+return FALSE.
+
+===== [PDF page 167] =====
+Chapter 6: Kernel Mechanisms
+161
+The InterlockedCompareExchange family of functions are used in lock-free programming,
+a programming technique to perform complex atomic operations without using software
+objects. This topic is well beyond the scope of this book.
+The functions in table 6-2 are also available in user mode, as these are not really functions, but
+rather CPU intrinsics - special instructions to the CPU.
+Dispatcher Objects
+The kernel provides a set of primitives known as Dispatcher Objects, also called Waitable Objects. These
+objects have a state, either signaled or non-signaled, where the meaning of signaled and non-signaled
+depends on the type of object. They are called “waitable” because a thread can wait on such objects until
+they become signaled. While waiting, the thread does not consume CPU cycles as it’s in a Waiting state.
+The primary functions used for waiting are KeWaitForSingleObject and KeWaitForMultipleOb-
+jects. Their prototypes (with simplified SAL annotations for clarity) are shown below:
+NTSTATUS KeWaitForSingleObject (
+_In_ PVOID Object,
+_In_ KWAIT_REASON WaitReason,
+_In_ KPROCESSOR_MODE WaitMode,
+_In_ BOOLEAN Alertable,
+_In_opt_ PLARGE_INTEGER Timeout);
+NTSTATUS KeWaitForMultipleObjects (
+_In_ ULONG Count,
+_In_reads_(Count) PVOID Object[],
+_In_ WAIT_TYPE WaitType,
+_In_ KWAIT_REASON WaitReason,
+_In_ KPROCESSOR_MODE WaitMode,
+_In_ BOOLEAN Alertable,
+_In_opt_ PLARGE_INTEGER Timeout,
+_Out_opt_ PKWAIT_BLOCK WaitBlockArray);
+Here is a rundown of the arguments to these functions:
+• Object - specifies the object to wait for. Note these functions work with objects, not handles. If you
+have a handle (maybe provided by user mode), call ObReferenceObjectByHandle to get the
+pointer to the object.
+• WaitReason - specifies the wait reason. The list of wait reasons is pretty long, but drivers should
+typically set it to Executive, unless it’s waiting because of a user request, and if so specify
+UserRequest.
+
+===== [PDF page 168] =====
+Chapter 6: Kernel Mechanisms
+162
+• WaitMode - can be UserMode or KernelMode. Most drivers should specify KernelMode.
+• Alertable - indicates if the thread should be in an alertable state during the wait. Alertable state
+allows delivering of user mode Asynchronous Procedure Calls (APCs). User mode APCs can be
+delivered if wait mode is UserMode. Most drivers should specify FALSE.
+• Timeout - specifies the time to wait. If NULL is specified, the wait is indefinite - as long as it takes for
+the object to become signaled. The units of this argument are in 100nsec chunks, where a negative
+number is relative wait, while a positive number is an absolute wait measured from January 1, 1601
+at midnight.
+• Count - the number of objects to wait on.
+• Object[] - an array of object pointers to wait on.
+• WaitType - specifies whether to wait for all object to become signaled at once (WaitAll) or just
+one object (WaitAny).
+• WaitBlockArray - an array of structures used internally to manage the wait operation. It’s optional if
+the number of objects is <= THREAD_WAIT_OBJECTS (currently 3) - the kernel will use the built-in
+array present in each thread. If the number of objects is higher, the driver must allocate the correct
+size of structures from non-paged memory, and deallocate them after the wait is over.
+The main return values from KeWaitForSingleObject are:
+• STATUS_SUCCESS - the wait is satisfied because the object state has become signaled.
+• STATUS_TIMEOUT - the wait is satisfied because the timeout has elapsed.
+Note that all return values from the wait functions pass the NT_SUCCESS macro with true.
+KeWaitForMultipleObjects return values include STATUS_TIMEOUT just as KeWaitForSingleOb-
+ject. STATUS_SUCCESS is returned if WaitAll wait type is specified and all objects become signaled.
+For WaitAny waits, if one of the objects became signaled, the return value is STATUS_WAIT_0 plus its
+index in the array of objects (Note that STATUS_WAIT_0 is defined to be zero).
+There are some fine details associated with the wait functions, especially if wait mode is
+UserMode and the wait is alertable. Check the WDK docs for the details.
+Table 6-3 lists some of the common dispatcher objects and the meaning of signaled and non-signaled for
+these objects.
+
+===== [PDF page 169] =====
+Chapter 6: Kernel Mechanisms
+163
+Table 6-3: Object Types and signaled meaning
+Object Type
+Signaled meaning
+Non-Signaled meaning
+Process
+process has terminated (for whatever reason)
+process has not terminated
+Thread
+thread has terminated (for whatever reason)
+thread has not terminated
+Mutex
+mutex is free (unowned)
+mutex is held
+Event
+event is set
+event is reset
+Semaphore
+semaphore count is greater than zero
+semaphore count is zero
+Timer
+timer has expired
+timer has not yet expired
+File
+asynchronous I/O operation completed
+asynchronous I/O operation is in progress
+All the object types from table 6-3 are also exported to user mode. The primary waiting
+functions in user mode are WaitForSingleObject and WaitForMultipleObjects.
+The following sections will discuss some of common object types useful for synchronization in drivers.
+Some other objects will be discussed as well that are not dispatcher objects, but support waiting as well.
+Mutex
+Mutex is the classic object for the canonical problem of one thread among many that can access a shared
+resource at any one time.
+Mutex is sometimes referred to as Mutant (its original name). These are the same thing.
+A mutex is signaled when it’s free. Once a thread calls a wait function and the wait is satisfied, the mutex
+becomes non-signaled and the thread becomes the owner of the mutex. Ownership is critical for a mutex.
+It means the following:
+• If a thread is the owner of a mutex, it’s the only one that can release the mutex.
+• A mutex can be acquired more than once by the same thread. The second attempt succeeds
+automatically since the thread is the current owner of the mutex. This also means the thread needs
+to release the mutex the same number of times it was acquired; only then the mutex becomes free
+(signaled) again.
+Using a mutex requires allocating a KMUTEX structure from non-paged memory. The mutex API contains
+the following functions working on that KMUTEX:
+• KeInitializeMutex or KeInitializeMutant must be called once to initialize the mutex.
+• One of the waiting functions, passing the address of the allocated KMUTEX structure.
+• KeReleaseMutex is called when a thread that is the owner of the mutex wants to release it.
+Here are the definitions of the APIs that can initialize a mutex:
+
+===== [PDF page 170] =====
+Chapter 6: Kernel Mechanisms
+164
+VOID KeInitializeMutex (
+_Out_ PKMUTEX Mutex,
+_In_ ULONG Level);
+VOID KeInitializeMutant (
+// defined in ntifs.h
+_Out_ PKMUTANT Mutant,
+_In_ BOOLEAN InitialOwner);
+The Level parameter in KeInitializeMutex is not used, so zero is a good value as any. KeIni-
+tializeMutant allows specifying if the current thread should be the initial owner of the mutex.
+KeInitializeMutex initializes the mutex to be unowned.
+Releasing the mutex is done with KeReleaseMutex:
+LONG KeReleaseMutex (
+_Inout_ PKMUTEX Mutex,
+_In_ BOOLEAN Wait);
+The returned value is the previous state of the mutex object (including recursive ownership count), and
+should mostly be ignored (although it may sometimes be useful for debugging purposes). The Wait
+parameter indicates whether the next API call is going to be one of the wait functions. This is used as
+a hint to the kernel that can optimize slightly if the thread is about to enter a wait state.
+As part of calling KeReleaseMutex, the IRQL is raised to DISPATCH_LEVEL. If
+Wait is TRUE, the IRQL is not lowered, which would allow the next wait function
+(KeWaitForSingleObject or KeWaitForSingleObject) to execute more efficiently, as
+no context switch can interfere.
+Given the above functions, here is an example using a mutex to access some shared data so that only a
+single thread does so at a time:
+KMUTEX MyMutex;
+LIST_ENTRY DataHead;
+void Init() {
+KeInitializeMutex(&MyMutex, 0);
+}
+void DoWork() {
+// wait for the mutex to be available
+KeWaitForSingleObject(&MyMutex, Executive, KernelMode, FALSE, nullptr);
+// access DataHead freely
+
+===== [PDF page 171] =====
+Chapter 6: Kernel Mechanisms
+165
+// once done, release the mutex
+KeReleaseMutex(&MyMutex, FALSE);
+}
+It’s important to release the mutex no matter what, so it’s better to use __try / __finally to make sure
+it’s executed however the __try block is exited:
+void DoWork() {
+// wait for the mutex to be available
+KeWaitForSingleObject(&MyMutex, Executive, KernelMode, FALSE, nullptr);
+__try {
+// access DataHead freely
+}
+__finally {
+// once done, release the mutex
+KeReleaseMutex(&MyMutex, FALSE);
+}
+}
+Figure 6-10 shows two threads attempting to acquire the mutex at roughly the same time, as they want to
+access the same data. One thread succeeds in acquiring the mutex, the other has to wait until the mutex
+is released by the owner before it can acquire it.
+
+===== [PDF page 172] =====
+Chapter 6: Kernel Mechanisms
+166
+Figure 6-10: Acquiring a mutex
+Since using __try/__finally is a bit awkward, we can use C++ to create a RAII wrapper for waits. This
+could also be used for other synchronization primitives.
+First, we’ll create a mutex wrapper that provides functions named Lock and Unlock:
+struct Mutex {
+void Init() {
+KeInitializeMutex(&_mutex, 0);
+}
+void Lock() {
+KeWaitForSingleObject(&_mutex, Executive, KernelMode, FALSE, nullptr);
+}
+void Unlock() {
+
+===== [PDF page 173] =====
+Chapter 6: Kernel Mechanisms
+167
+KeReleaseMutex(&_mutex, FALSE);
+}
+private:
+KMUTEX _mutex;
+};
+Then we can create a generic RAII wrapper for waiting for any type that has a Lock and Unlock functions:
+template<typename TLock>
+struct Locker {
+explicit Locker(TLock& lock) : _lock(lock) {
+lock.Lock();
+}
+~Locker() {
+_lock.Unlock();
+}
+private:
+TLock& _lock;
+};
+With these definitions in place, we can replace the code using the mutex with the following:
+Mutex MyMutex;
+void Init() {
+MyMutex.Init();
+}
+void DoWork() {
+Locker<Mutex> locker(MyMutex);
+// access DataHead freely
+}
+
+===== [PDF page 174] =====
+Chapter 6: Kernel Mechanisms
+168
+Since locking should be done for the shortest time possible, you can use an artificial C/C++
+scope containing Locker and the code to execute while the mutex is owned, to acquire the
+mutex as late as possible and release it as soon as possible.
+With C++ 17 and later, Locker can be used without specifying the type like so:
+Locker locker(MyMutex);
+Since Visual Studio currently uses C++ 14 as its default language standard, you’ll have to change
+that in the project properties under the General node / C++ Language Standard.
+We’ll use the same Locker type with other synchronization primitives in subsequent sections.
+Abandoned Mutex
+A thread that acquires a mutex becomes the mutex owner. The owner thread is the only one that can
+release the mutex. What happens to the mutex if the owner thread dies for whatever reason? The mutex
+then becomes an abandoned mutex. The kernel explicitly releases the mutex (as no thread can do it) to
+prevent a deadlock, so another thread would be able to acquire that mutex normally. However, the returned
+value from the next successful wait call is STATUS_ABANDONED rather than STATUS_SUCCESS. A driver
+should log such an occurrence, as it frequently indicates a bug.
+Other Mutex Functions
+Mutexes support a few miscellaneous functions that may be useful at times, mostly for debugging purposes.
+KeReadStateMutex returns the current state (recursive count) of the mutex, where 0 means “unowned”:
+LONG KeReadStateMutex (_In_ PKMUTEX Mutex);
+Just remember that after the call returns, the result may no longer be correct as the mutex state may have
+changed because some other thread has acquired or released the mutex before the code gets to examine
+the result. The benefit of this function is in debugging scenarios only.
+You can get the current mutex owner with a call to KeQueryOwnerMutant (defined in <ntifs.h>) as a
+CLIENT_ID data structure, containing the thread and process IDs:
+VOID KeQueryOwnerMutant (
+_In_ PKMUTANT Mutant,
+_Out_ PCLIENT_ID ClientId);
+Just like with KeReadStateMutex, the returned information may be stale if other threads are doing work
+with that mutex.
+
+===== [PDF page 175] =====
+Chapter 6: Kernel Mechanisms
+169
+Fast Mutex
+A fast mutex is an alternative to the classic mutex, providing better performance. It’s not a dispatcher
+object, and so has its own API for acquiring and releasing it. A fast mutex has the following characteristics
+compared with a regular mutex:
+• A fast mutex cannot be acquired recursively. Doing so causes a deadlock.
+• When a fast mutex is acquired, the CPU IRQL is raised to APC_LEVEL (1). This prevents any delivery
+of APCs to that thread.
+• A fast mutex can only be waited on indefinitely - there is no way to specify a timeout.
+Because of the first two bullets above, the fast mutex is slightly faster than a regular mutex. In fact, most
+drivers requiring a mutex use a fast mutex unless there is a compelling reason to use a regular mutex.
+Don’t use I/O operations while holding on to a fast mutex. I/O completions are delivered with
+a special kernel APC, but those are blocked while holding a fast mutex, creating a deadlock.
+A fast mutex is initialized by allocating a FAST_MUTEX structure from non-paged memory and calling
+ExInitializeFastMutex. Acquiring the mutex is done with ExAcquireFastMutex or ExAcquire-
+FastMutexUnsafe (if the current IRQL happens to be APC_LEVEL already). Releasing a fast mutex is
+accomplished with ExReleaseFastMutex or ExReleaseFastMutexUnsafe.
+Semaphore
+The primary goal of a semaphore is to limit something, such as the length of a queue. The semaphore
+is initialized with its maximum and initial count (typically set to the maximum value) by calling
+KeInitializeSemaphore. While its internal count is greater than zero, the semaphore is signaled. A
+thread that calls KeWaitForSingleObject has its wait satisfied, and the semaphore count drops by one.
+This continues until the count reaches zero, at which point the semaphore becomes non-signaled.
+Semaphores use the KSEMAPHORE structure to hold their state, which must be allocated from non-paged
+memory. Here is the definition of KeInitializeSemaphore:
+VOID KeInitializeSemaphore (
+_Out_ PRKSEMAPHORE Semaphore,
+_In_ LONG Count,
+// starting count
+_In_ LONG Limit);
+// maximum count
+As an example, imagine a queue of work items managed by the driver. Some threads want to add items to
+the queue. Each such thread calls KeWaitForSingleObject to obtain one “count” of the semaphore. As
+long as the count is greater than zero, the thread continues and adds an item to the queue, increasing its
+length, and semaphore “loses” a count. Some other threads are tasked with processing work items from the
+queue. Once a thread removes an item from the queue, it calls KeReleaseSemaphore that increments
+the count of the semaphore, moving it to the signaled state again, allowing potentially another thread to
+make progress and add a new item to the queue.
+KeReleaseSemaphore is defined like so:
+
+===== [PDF page 176] =====
+Chapter 6: Kernel Mechanisms
+170
+LONG KeReleaseSemaphore (
+_Inout_ PRKSEMAPHORE Semaphore,
+_In_ KPRIORITY Increment,
+_In_ LONG Adjustment,
+_In_ BOOLEAN Wait);
+The Increment parameter indicates the priority boost to apply to the thread that has a successful waiting
+on the semaphore. The details of how this boost works are described in the next chapter. Most drivers
+should provide the value 1 (that’s the default used by the kernel when a semaphore is released by the
+user mode ReleaseSemaphore API). Adjustment is the value to add to the semaphore’s current count.
+It’s typically one, but can be a higher value if that makes sense. The last parameter (Wait) indicates
+whether a wait operation (KeWaitForSingleObject or KeWaitFOrMultipleObjects) immediately
+follows (see the information bar in the mutex discussion above). The function returns the old count of the
+semaphore.
+Is a semaphore with a maximum count of one equivalent to a mutex? At first, it seems so,
+but this is not the case. A semaphore lacks ownership, meaning one thread can acquire the
+semaphore, while another can release it. This is a strength, not a weakness, as described in the
+above example. A Semaphore’s purpose is very different from that of a mutex.
+You can read the current count of the semaphore by calling KeReadStateSemaphore:
+LONG KeReadStateSemaphore (_In_ PRKSEMAPHORE Semaphore);
+Event
+An event encapsulates a boolean flag - either true (signaled) or false (non-signaled). The primary purpose
+of an event is to signal something has happened, to provide flow synchronization. For example, if some
+condition becomes true, an event can be set, and a bunch of threads can be released from waiting and
+continue working on some data that perhaps is now ready for processing.
+The are two types of events, the type being specified at event initialization time:
+• Notification event (manual reset) - when this event is set, it releases any number of waiting threads,
+and the event state remains set (signaled) until explicitly reset.
+• Synchronization event (auto reset) - when this event is set, it releases at most one thread (no matter
+how many are waiting for the event), and once released the event goes back to the reset (non-
+signaled) state automatically.
+An event is created by allocating a KEVENT structure from non-paged memory and then calling
+KeInitializeEvent to initialize it, specifying the event type (NotificationEvent or Synchro-
+nizationEvent) and the initial event state (signaled or non-signaled):
+
+===== [PDF page 177] =====
+Chapter 6: Kernel Mechanisms
+171
+VOID KeInitializeEvent (
+_Out_ PRKEVENT Event,
+_In_ EVENT_TYPE Type,
+// NotificationEvent or SynchronizationEvent
+_In_ BOOLEAN State);
+// initial state (signaled=TRUE)
+Notification events are called Manual-reset in user-mode terminology, while Synchronization events are
+called Auto-reset. Despite the name changes, these are the same.
+Waiting for an event is done normally with the KeWaitXxx functions. Calling KeSetEvent sets the event
+to the signaled state, while calling KeResetEvent or KeClearEvent resets it (non-signaled state) (the
+latter function being a bit quicker as it does not return the previous state of the event):
+LONG KeSetEvent (
+_Inout_ PRKEVENT Event,
+_In_ KPRIORITY Increment,
+_In_ BOOLEAN Wait);
+VOID KeClearEvent (_Inout_ PRKEVENT Event);
+LONG KeResetEvent (_Inout_ PRKEVENT Event);
+Just like with a semaphore, setting an event allows providing a priority boost to the next successful wait
+on the event.
+Finally, The current state of an event (signaled or non-signaled) can be read with KeReadStateEvent:
+LONG KeReadStateEvent (_In_ PRKEVENT Event);
+Named Events
+Event objects can be named (as can mutexes and semaphores). This can be used as an easy way
+of sharing an event object with other drivers or with user-mode clients. One way of creating or
+opening a named event by name is with the helper functions IoCreateSynchronizationEvent and
+IoCreateNotificationEvent APIs:
+PKEVENT IoCreateSynchronizationEvent(
+_In_
+PUNICODE_STRING EventName,
+_Out_ PHANDLE EventHandle);
+PKEVENT IoCreateNotificationEvent(
+_In_
+PUNICODE_STRING EventName,
+_Out_ PHANDLE EventHandle);
+
+===== [PDF page 178] =====
+Chapter 6: Kernel Mechanisms
+172
+These APIs create the named event object if it does not exist and set its state to signaled, or obtain another
+handle to the named event if it does exist. The name itself is provided as a normal UNICODE_STRING and
+must be a full path in the Object Manager’s namespace, as can be observed in the Sysinternals WinObj
+tool.
+These APIs return two values: the pointer to the event object (direct returned value) and an open handle in
+the EventHandle parameter. The returned handle is a kernel handle, to be used by the driver only. The
+functions return NULL on failure.
+You can use the previously described events API to manipulate the returned event by address. Don’t
+forget to close the returned handle (ZwClose) to prevent a leak. Alternatively, you can call ObRefer-
+enceObject on the returned pointer to make sure it’s not prematurely destroyed and close the handle
+immediately. In that case, call ObDereferenceObject when you’re done with the event.
+Built-in Named Kernel Events
+One use of the IoCreateNotificationEvent API is to gain access to a bunch of named event objects
+the kernel provides in the \KernelObejcts directory. These events provide various notifications for memory
+related status, that may be useful for kernel drivers.
+Figure 6-11 shows the named events in WinObj. Note that the lower symbolic links are actually events, as
+these are internally implemented as Dynamic Symbolic Links (see more details at https://scorpiosoftware.
+net/2021/04/30/dynamic-symbolic-links/).
+Figure 6-11: Kernel Named Events
+
+===== [PDF page 179] =====
+Chapter 6: Kernel Mechanisms
+173
+All the events shown in figure 6-11 are Notification events. Table 6-5 lists these events with their meaning.
+Table 6-5: Named kernel events
+Name
+Description
+HighMemoryCondition
+The system has lots of free physical memory
+LowMemoryCondition
+The system is low on physical memory
+HighPagedPoolCondition
+The system has lots of free paged pool memory
+LowPagedPoolCondition
+The system is low on paged pool memory
+HighNonPagedPoolCondition
+The system has lots of free non-paged pool memory
+LowNonPagedPoolCondition
+The system is low on non-paged pool memory
+HighCommitCondition
+The system has lots of free memory in RAM and paging file(s)
+LowCommitCondition
+The system is low on RAM and paging file(s)
+MaximumCommitCondition
+The system is almost out of memory, and no further increase in page files size is
+possible
+Drivers can use these events as hints to either allocate more memory or free memory as required. The
+following example shows how to obtain one of these events and wait for it on some thread (error handling
+ommitted):
+UNICODE_STRING name;
+RtlInitUnicodeString(&name, L"\\KernelObjects\\LowCommitCondition");
+HANDLE hEvent;
+auto event = IoCreateNotificationEvent(&name, &hEvent);
+// on some driver-created thread...
+KeWaitForSingleObject(event, Executive, KernelMode, FALSE, nullptr);
+// free some memory if possible...
+//
+// close the handle
+ZwClose(hEvent);
+Write a driver that waits on all these named events and uses DbgPrint to indicate a signaled
+event with its description.
+Executive Resource
+The classic synchronization problem of accessing a shared resource by multiple threads was dealt with by
+using a mutex or fast mutex. This works, but mutexes are pessimistic, meaning they allow a single thread
+
+===== [PDF page 180] =====
+Chapter 6: Kernel Mechanisms
+174
+to access a shared resource. That may be unfortunate in cases where multiple threads access a shared
+resource by reading only.
+In cases where it’s possible to distinguish data changes (writes) vs. just looking at the data (reading)
+- there is a possible optimization. A thread that requires access to the shared resource can declare its
+intentions - read or write. If it declares read, other threads declaring read can do so concurrently, improving
+performance. This is especially useful if the shared data changes infrequently, i.e. there are considerably
+more reads than writes.
+Mutexes by their very nature are pessimistic locks, since they enforce a single thread at a time execution.
+This makes them always work at the expense of possible performance gains with concurrency.
+The kernel provides yet another synchronization primitive that is geared towards this scenario, known as
+single writer, multiple readers. This object is the Executive Resource, another special object which is not a
+dispatcher object.
+Initializing an executive resource is done by allocating an ERESOURCE structure from non-paged pool
+and calling ExInitializeResourceLite. Once initialized, threads can acquire either the exclusive
+lock (for writes) using ExAcquireResourceExclusiveLite or the shared lock by calling ExAc-
+quireResourceSharedLite. Once done the work, a thread releases the executive resource with
+ExReleaseResourceLite (no matter whether it acquired as exclusive or not).
+The requirement for using the acquire and release functions is that normal kernel APCs must be
+disabled. This can be done with KeEnterCtriticalRegion just before the acquire call, and then
+KeLeaveCriticalRegion just after the release call. The following code snippet demonstrates that:
+ERESOURCE resource;
+void WriteData() {
+KeEnterCriticalRegion();
+ExAcquireResourceExclusiveLite(&resource, TRUE);
+// wait until acquired
+// Write to the data
+ExReleaseResourceLite(&resource);
+KeLeaveCriticalRegion();
+}
+Since these calls are so common when working with executive resources, there are functions that perform
+both operations with a single call:
+
+===== [PDF page 181] =====
+Chapter 6: Kernel Mechanisms
+175
+void WriteData() {
+ExEnterCriticalRegionAndAcquireResourceExclusive(&resource);
+// Write to the data
+ExReleaseResourceAndLeaveCriticalRegion(&resource);
+}
+A similar function exists for shared acquisition, ExEnterCriticalRegionAndAcquireResource-
+Shared. Finally, before freeing the memory the resource occupies, call ExDeleteResourceLite to
+remove the resource from the kernel’s resource list:
+NTSTATUS ExDeleteResourceLite(
+_Inout_ PERESOURCE Resource);
+You can query the number of waiting threads for exclusive and shared access of a resource with the
+functions ExGetExclusiveWaiterCount and ExGetSharedWaiterCount, respectively.
+There are other functions for working with executive resources for some specialized cases. Consult the
+WDK documentation for more information.
+Create appropriate C++ RAII wrappers for executive resources.
+High IRQL Synchronization
+The sections on synchronization so far have dealt with threads waiting for various types of objects. How-
+ever, in some scenarios, threads cannot wait - specifically, when the processor’s IRQL is DISPATCH_LEVEL
+(2) or higher. This section discusses these scenarios and how to handle them.
+Let’s examine an example scenario: A driver has a timer, set up with KeSetTimer and uses a DPC to
+execute code when the timer expires. At the same time, other functions in the driver, such an IRP_MJ_-
+DEVICE_CONTROL may execute at the same time (runs at IRQL 0). If both these functions need to access
+a shared resource (e.g. a linked list), they must synchronize access to prevent data corruption.
+The problem is that a DPC cannot call KeWaitForSingleObject or any other waiting function - calling
+any of these is fatal. So how can these functions synchronize access?
+The simple case is where the system has a single CPU. In this case, when accessing the shared resource, the
+low IRQL function just needs to raise IRQL to DISPATCH_LEVEL and then access the resource. During
+
+===== [PDF page 182] =====
+Chapter 6: Kernel Mechanisms
+176
+that time a DPC cannot interfere with this code since the CPU’s IRQL is already 2. Once the code is done
+with the shared resource, it can lower the IRQL back to zero, allowing the DPC to execute. This prevents
+execution of these routines at the same time. Figure 6-12 shows this setup.
+Figure 6-12: High-IRQL synchronization by manipulating IRQL
+In standard systems, where there is more than one CPU, this synchronization method is not enough,
+because the IRQL is a CPU’s property, not a system-wide property. If one CPU’s IRQL is raised to 2, if a
+DPC needs to execute, it can execute on another CPU whose IRQL may be zero. In this case, it’s possible
+that both functions execute at the same time, accessing the shared data, causing a data race.
+How can we solve that? We need something like a mutex, but that can synchronize between processors -
+not threads. That’s because when the CPU’s IRQL is 2 or higher, the thread itself loses meaning because
+the scheduler cannot do work on that CPU. This kind of object exists - the Spin Lock.
+
+===== [PDF page 183] =====
+Chapter 6: Kernel Mechanisms
+177
+The Spin Lock
+The Spin Lock is just a bit in memory that is used with atomic test-and-set operations via an API. When
+a CPU tries to acquire a spin lock, and that spin lock is not currently free (the bit is set), the CPU keeps
+spinning on the spin lock, busy waiting for it to be released by another CPU (remember, putting the thread
+into a waiting state cannot be done at IRQL DISPATCH_LEVEL or higher).
+In the scenario depicted in the previous section, a spin lock would need to be allocated and initialized. Each
+function that requires access to the shared data needs to raise IRQL to 2 (if not already there), acquire the
+spin lock, perform the work on the shared data, and finally release the spin lock and lower IRQL back (if
+applicable; not so for a DPC). This chain of events is depicted in figure 6-13.
+Creating a spin lock requires allocating a KSPIN_LOCK structure from non-paged pool, and calling
+KeInitializeSpinLock. This puts the spin lock in the unowned state.
+
+===== [PDF page 184] =====
+Chapter 6: Kernel Mechanisms
+178
+Figure 6-13: High-IRQL synchronization with a Spin Lock
+Acquiring a spin lock is always a two-step process: first, raise the IRQL to the proper level, which is the
+highest level of any function trying to synchronize access to a shared resource. In the previous example, this
+associated IRQL is 2. Second, acquire the spin lock. These two steps are combined by using the appropriate
+API. This process is depicted in figure 6-14.
+
+===== [PDF page 185] =====
+Chapter 6: Kernel Mechanisms
+179
+Figure 6-14: Acquiring a Spin Lock
+Acquiring and releasing a spin lock is done using an API that performs the two steps outlined in figure
+6-12. Table 6-4 shows the relevant APIs and the associated IRQL for the spin locks they operate on.
+Table 6-4: APIs for working with spin locks
+IRQL
+Acquire function
+Release function
+Remarks
+DISPATCH_LEVEL (2)
+KeAcquireSpinLock
+KeReleaseSpinLock
+DISPATCH_LEVEL (2)
+KeAcquireSpinLockAtDpcLevel KeReleaseSpinLockFromDpcLevel
+(a)
+Device IRQL
+KeAcquireInterruptSpinLock
+KeReleaseInterruptSpinLock
+(b)
+Device IRQL
+KeSynchronizeExecution
+(none)
+(c)
+HIGH_LEVEL
+ExInterlockedXxx
+(none)
+(d)
+Remarks on table 6-4:
+(a) Can be called at IRQL 2 only. Provides an optimization that just acquires the spin lock without changing
+IRQLs. The canonical scenario is calling these APIs within a DPC routine.
+(b) Useful for synchronizing an ISR with any other function. Hardware-based drivers with an interrupt
+source use these routines. The argument is an interrupt object (KINTERRUPT), where the spin lock is part
+of it.
+(c) KeSynchronizeExecution acquires the interrupt object spin lock, calls the porovided callback and
+releases the spin lock. The net effect is the same as calling the pair KeAcquireInterruptSpinLock /
+
+===== [PDF page 186] =====
+Chapter 6: Kernel Mechanisms
+180
+KeReleaseInterruptSpinLock.
+(d) A set of three functions for manipulating LIST_ENTRY-based linked lists. These functions use the
+provided spin lock and raise IRQL to HIGH_LEVEL. Because of the high IRQL, these routines can be used
+in any IRQL, since raising IRQL is always a safe operation.
+If you acquire a spin lock, be sure to release it in the same function. Otherwise, you’re risking
+a deadlock or a system crash.
+Where do spin locks come from? The scenario described here requires the driver to allocate its
+own spin lock to protect concurrent access to its own data from high-IRQL functions. Some spin
+locks exist as part of other objects, such as the KINTERRUPT object used by hardware-based
+drivers that handle interrupts. Another example is a system-wide spin lock known as the Cancel
+spin lock, which is acquired by the kernel before calling a cancellation routine registered by a
+driver. This is the only case where a driver released a spin lock it has not acquired explicitly.
+If several CPUs try to acquire the same spin lock at the same time, which CPU gets the spin lock
+first? Normally, there is no order - the CPU with fastest electrons wins :). The kernel does pro-
+vide an alternative, called Queued spin locks that serve CPUs on a FIFO basis. These only work
+with IRQL DISPATCH_LEVEL. The relevant APIs are KeAcquireInStackQueuedSpinLock
+and KeReleaseInStackQueuedSpinLock. Check the WDK documentation for more de-
+tails.
+Write a C++ wrapper for a DISPATCH_LEVEL spin lock that works with the Locker RAII class
+defined earlier in this chapter.
+Queued Spin Locks
+A variant on classic spin locks are queued spin locks. These behave the same as normal spin locks, with
+the following differences:
+• Queued spin locks always raise to IRQL DISPTACH_LEVEL (2). This means they cannot be used for
+synchronizing with an ISR, for example.
+• There is a queue of CPU waiting to acquire the spin lock, on a FIFO basis. This is more efficient when
+high contention is expected. Normal spin locks provide no gauarantee as to the order of acquisition
+when multiple CPUs attempt to acquire a spin lock.
+A queued spin lock is initialized just like a normal spin lock (KeInitializeSpinLock). Acquiring and
+releasing a queued spin lock is achieved with different APIs:
+
+===== [PDF page 187] =====
+Chapter 6: Kernel Mechanisms
+181
+void KeAcquireInStackQueuedSpinLock (
+_Inout_ PKSPIN_LOCK SpinLock,
+_Out_ PKLOCK_QUEUE_HANDLE LockHandle);
+void KeReleaseInStackQueuedSpinLock (
+_In_ PKLOCK_QUEUE_HANDLE LockHandle);
+Except for a spin lock, the caller provides an opaque KLOCK_QUEUE_HANDLE structure that is filled in by
+KeAcquireInStackQueuedSpinLock. The same one must be passed to KeReleaseInStackQueued-
+SpinLock.
+Just like with normal dispatch-level spin locks, shortcuts exist if the caller is already at IRQL DIS-
+PATCH_LEVEL. KeAcquireInStackQueuedSpinLockAtDpcLevel acquires the spin lock with no
+IRQL changes, while KeReleaseInStackQueuedSpinLockFromDpcLevel releases it.
+Write a C++ RAII wrapper for a queued spin lock.
+Work Items
+Sometimes there is a need to run a piece of code on a different thread than the executing one. One
+way to do that is to create a thread explicitly and task it with running the code. The kernel provides
+functions that allow a driver to create a separate thread of execution: PsCreateSystemThread and
+IoCreateSystemThread (available in Windows 8+). These functions are appropriate if the driver needs
+to run code in the background for a long time. However, for time-bound operations, it’s better to use a
+kernel-provided thread pool that will execute your code on some system worker thread.
+PsCreateSystemThread and IoCreateSystemThread are discussed in chapter 8.
+IoCreateSystemThread is preferred over PsCreateSystemThread, because is allows
+associating a device or driver object with the thread. This makes the I/O system add a reference
+to the object, which makes sure the driver cannot be unloaded prematurely while the thread is
+still executing.
+A
+driver-created
+thread
+must
+terminate
+itself
+eventually
+by
+calling
+PsTerminateSystemThread. This function never returns if successful.
+Work items is the term used to describe functions queued to the system thread pool. A driver can allocate
+and initialize a work item, pointing to the function the driver wishes to execute, and then the work item
+can be queued to the pool. This may seem very similar to a DPC, the primary difference being work items
+
+===== [PDF page 188] =====
+Chapter 6: Kernel Mechanisms
+182
+always execute at IRQL PASSIVE_LEVEL (0). Thus, work items can be used by IRQL 2 code (such as
+DPCs) to perform operations not normally allowed at IRQL 2 (such as I/O operations).
+Creating and initializing a work item can be done in one of two ways:
+• Allocate and initialize the work item with IoAllocateWorkItem. The function returns a pointer
+to the opaque IO_WORKITEM. When finished with the work item it must be freed with IoFree-
+WorkItem.
+• Allocate an IO_WORKITEM structure dynamically with size provided by IoSizeofWorkItem.
+Then call IoInitializeWorkItem. When finished with the work item, call IoUninitialize-
+WorkItem.
+These functions accept a device object, so make sure the driver is not unloaded while there is a work item
+queued or executing.
+There is another set of APIs for work items, all start with Ex, such as ExQueueWorkItem.
+These functions do not associate the work item with anything in the driver, so it’s possible
+for the driver to be unloaded while a work item is still executing. These APIs are marked as
+deprecated - always prefer using the Io functions.
+To queue the work item, call IoQueueWorkItem. Here is its definition:
+viud IoQueueWorkItem(
+_Inout_ PIO_WORKITEM IoWorkItem,
+// the work item
+_In_ PIO_WORKITEM_ROUTINE WorkerRoutine,
+// the function to be called
+_In_ WORK_QUEUE_TYPE QueueType,
+// queue type
+_In_opt_ PVOID Context);
+// driver-defined value
+The callback function the driver needs to provide has the following prototype:
+IO_WORKITEM_ROUTINE WorkItem;
+void WorkItem(
+_In_
+PDEVICE_OBJECT DeviceObject,
+_In_opt_ PVOID
+Context);
+The system thread pool has several queues (at least logically), based on the thread priorities that serve
+these work items. There are several levels defined:
+
+===== [PDF page 189] =====
+Chapter 6: Kernel Mechanisms
+183
+typedef enum _WORK_QUEUE_TYPE {
+CriticalWorkQueue,
+// priority 13
+DelayedWorkQueue,
+// priority 12
+HyperCriticalWorkQueue,
+// priority 15
+NormalWorkQueue,
+// priority 8
+BackgroundWorkQueue,
+// priority 7
+RealTimeWorkQueue,
+// priority 18
+SuperCriticalWorkQueue,
+// priority 14
+MaximumWorkQueue,
+CustomPriorityWorkQueue = 32
+} WORK_QUEUE_TYPE;
+The documentation indicates DelayedWorkQueue must be used, but in reality, any other supported level
+can be used.
+There is another function that can be used to queue a work item: IoQueueWorkItemEx. This
+function uses a different callback that has an added parameter which is the work item itself.
+This is useful if the work item function needs to free the work item before it exits.
+Summary
+In this chapter, we looked at various kernel mechanisms driver developers should be aware of and use. In
+the next chapter, we’ll take a closer look at I/O Request Packets (IRPs).
